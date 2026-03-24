@@ -38,8 +38,36 @@ interface CLIArgs {
   plan: boolean;
 }
 
+function printHelp(): void {
+  console.log(`
+  Usage: appclaw [options] [goal]
+
+  Options:
+    --help              Show this help message
+    --version           Show version number
+    --flow <file.yaml>  Run declarative YAML steps (no LLM needed)
+
+  Examples:
+    appclaw "Open Settings"
+    appclaw "Send hello on WhatsApp to Mom"
+    appclaw "Turn on WiFi"
+    appclaw --flow examples/flows/google-search.yaml
+`);
+}
+
 function parseArgs(): CLIArgs {
   const args = process.argv.slice(2);
+
+  if (args.includes("--help") || args.includes("-h")) {
+    printHelp();
+    process.exit(0);
+  }
+
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log("0.1.0");
+    process.exit(0);
+  }
+
   let record = false;
   let replay: string | null = null;
   let flow: string | null = null;
