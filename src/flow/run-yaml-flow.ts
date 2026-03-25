@@ -413,8 +413,8 @@ async function assertTextVisible(
 
 /**
  * Scroll in a direction, checking after each scroll whether `text` is visible.
- * Unlike assertTextVisible, this always scrolls first before checking — it does
- * NOT check the current screen before the first scroll.
+ * Checks the current screen BEFORE the first scroll — if the target is already
+ * visible, returns immediately without scrolling (avoids pushing it off screen).
  */
 async function scrollUntilVisible(
   mcp: MCPClient,
@@ -426,39 +426,36 @@ async function scrollUntilVisible(
   const visionFirst = isVisionMode();
   const useVision = isVisionLocateEnabled();
 
+  // Helper: check if text is currently visible on screen
+  const isVisible = async (): Promise<boolean> => {
+    if (visionFirst) {
+      return visionAssert(mcp, text);
+    }
+    // DOM check first
+    const elements = await getScreenElements(mcp);
+    if (domContainsText(elements, text)) return true;
+    // Vision fallback in DOM mode
+    if (useVision) return visionAssert(mcp, text);
+    return false;
+  };
+
+  // ── Pre-scroll check: target may already be on screen ──
+  if (await isVisible()) {
+    return {
+      success: true,
+      message: `"${text}" already visible on screen (no scroll needed)`,
+    };
+  }
+
   for (let scroll = 0; scroll < maxScrolls; scroll++) {
-    // Scroll first
     await mcp.callTool("appium_scroll", { direction });
     await sleep(800);
 
-    // Check visibility after scroll
-    if (visionFirst) {
-      const visible = await visionAssert(mcp, text);
-      if (visible) {
-        return {
-          success: true,
-          message: `Found "${text}" after ${scroll + 1} scroll(s) ${direction} (via vision)`,
-        };
-      }
-    } else {
-      // DOM check
-      const elements = await getScreenElements(mcp);
-      if (domContainsText(elements, text)) {
-        return {
-          success: true,
-          message: `Found "${text}" after ${scroll + 1} scroll(s) ${direction}`,
-        };
-      }
-      // Vision fallback in DOM mode
-      if (useVision) {
-        const visible = await visionAssert(mcp, text);
-        if (visible) {
-          return {
-            success: true,
-            message: `Found "${text}" after ${scroll + 1} scroll(s) ${direction} (via vision)`,
-          };
-        }
-      }
+    if (await isVisible()) {
+      return {
+        success: true,
+        message: `Found "${text}" after ${scroll + 1} scroll(s) ${direction}`,
+      };
     }
   }
 
@@ -531,8 +528,18 @@ async function executeStep(
       return assertTextVisible(mcp, step.text, tapPoll);
     case "scrollAssert":
       return scrollUntilVisible(mcp, step.text, step.direction, step.maxScrolls, tapPoll);
-    case "done":
+    case "done": {
+      // When done has a message, treat it as an assertion — verify the claim
+      // is true on screen before declaring success. A bare `done` (no message)
+      // passes unconditionally.
+      if (step.message) {
+        const verification = await assertTextVisible(mcp, step.message, tapPoll);
+        if (!verification.success) {
+          return { success: false, message: `done assertion failed: "${step.message}" not verified on screen` };
+        }
+      }
       return { success: true, message: step.message ?? "done" };
+    }
   }
 }
 
@@ -560,18 +567,6 @@ export async function runYamlFlow(
     const label = stepLabel(step);
     const n = i + 1;
 
-    if (step.kind === "done") {
-      ui.printFlowStep(n, total, label, true);
-      executed++;
-      ui.printReplayResult(executed, total, 0);
-      return {
-        success: true,
-        stepsExecuted: executed,
-        stepsTotal: total,
-        reason: step.message,
-      };
-    }
-
     const result = await executeStep(mcp, step, meta, appResolver, tapPoll);
     ui.printFlowStep(n, total, label, result.success);
     executed++;
@@ -585,6 +580,17 @@ export async function runYamlFlow(
         stepsTotal: total,
         failedAt: n,
         reason: result.message,
+      };
+    }
+
+    // done step: stop flow after successful verification
+    if (step.kind === "done") {
+      ui.printReplayResult(executed, total, 0);
+      return {
+        success: true,
+        stepsExecuted: executed,
+        stepsTotal: total,
+        reason: step.message,
       };
     }
 
