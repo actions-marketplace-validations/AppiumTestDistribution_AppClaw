@@ -553,25 +553,56 @@ export function printPlanSummary(
   subGoals: Array<{ goal: string; status: string; result?: string }>,
 ): void {
   const passed = subGoals.filter(sg => sg.status === "completed").length;
+  const failed = subGoals.length - passed;
+  const tw = Math.min(termWidth() - 6, 90);
+
   console.log();
   console.log(hr("single", undefined, "Summary"));
   console.log();
-  printTable({
-    headers: ["#", "Goal", "Status", "Result"],
-    rows: subGoals.map((sg, i) => [
-      `${i + 1}`,
-      sg.goal,
-      sg.status === "completed" ? "✓ pass" : "✗ fail",
-      sg.result ?? "",
-    ]),
+
+  const table = new Table({
+    head: [
+      chalk.hex("#9CA3AF")("#"),
+      chalk.hex("#9CA3AF")("Goal"),
+      chalk.hex("#9CA3AF")("Status"),
+      chalk.hex("#9CA3AF")("Result"),
+    ],
+    style: { head: [], border: ["gray"] },
+    chars: ROUNDED_CHARS,
+    colWidths: [5, Math.floor(tw * 0.35), 10, Math.floor(tw * 0.45)],
+    wordWrap: true,
   });
+
+  for (let i = 0; i < subGoals.length; i++) {
+    const sg = subGoals[i];
+    const ok = sg.status === "completed";
+    const statusCell = ok
+      ? chalk.green("● pass")
+      : chalk.red("● fail");
+    const goalCell = ok
+      ? chalk.white(sg.goal)
+      : chalk.red(sg.goal);
+    const resultCell = ok
+      ? chalk.green(sg.result ?? "")
+      : chalk.red(sg.result ?? "");
+
+    table.push([
+      chalk.hex("#7C6FFF")(`${i + 1}`),
+      goalCell,
+      statusCell,
+      resultCell,
+    ]);
+  }
+
+  console.log(indent(table.toString()));
   console.log();
+
+  // Summary line
   const allOk = passed === subGoals.length;
-  const icon = allOk ? theme.success("✓") : theme.warn("!");
-  const msg = allOk
-    ? theme.success.bold(`${passed}/${subGoals.length} completed`)
-    : theme.warn.bold(`${passed}/${subGoals.length} completed`);
-  console.log(`  ${icon} ${msg}  ${progressBar(passed, subGoals.length, 15)}`);
+  const icon = allOk ? chalk.green("✓") : chalk.yellow("!");
+  const passText = chalk.green.bold(`${passed} passed`);
+  const failText = failed > 0 ? chalk.red.bold(` · ${failed} failed`) : "";
+  console.log(`  ${icon} ${passText}${failText}  ${progressBar(passed, subGoals.length, 15)}`);
   console.log();
 }
 
@@ -714,17 +745,14 @@ export function printTokenSummary(
   totalInput: number, totalOutput: number, cost: number, modelName: string,
 ): void {
   if (!Config.SHOW_TOKEN_USAGE) return;
+  const total = totalInput + totalOutput;
+  const content = [
+    `${chalk.hex("#9CA3AF")("Tokens")}  ${chalk.white.bold(total.toLocaleString())}  ${chalk.dim(`(in: ${totalInput.toLocaleString()}  out: ${totalOutput.toLocaleString()})`)}`,
+    `${chalk.hex("#9CA3AF")("Cost")}    ${chalk.green.bold(`$${cost.toFixed(4)}`)}`,
+    `${chalk.hex("#9CA3AF")("Model")}   ${chalk.dim(modelName)}`,
+  ].join("\n");
   console.log();
-  printTable({
-    headers: ["Metric", "Value"],
-    rows: [
-      ["Total tokens", (totalInput + totalOutput).toLocaleString()],
-      ["Input", totalInput.toLocaleString()],
-      ["Output", totalOutput.toLocaleString()],
-      ["Cost", `$${cost.toFixed(4)}`],
-      ["Model", modelName],
-    ],
-  });
+  printBox(content, { padding: { left: 2, right: 2, top: 0, bottom: 0 }, borderColor: "gray", dimBorder: true });
 }
 
 export function printJourneyTokenSummary(
@@ -733,19 +761,14 @@ export function printJourneyTokenSummary(
 ): void {
   const total = totalInput + totalOutput;
   if (total === 0) return;
-  console.log(hr("double", undefined, "Journey Summary"));
   console.log();
-  printTable({
-    headers: ["Metric", "Value"],
-    rows: [
-      ["Total tokens", total.toLocaleString()],
-      ["Input", totalInput.toLocaleString()],
-      ["Output", totalOutput.toLocaleString()],
-      ["Cost", `$${totalCost.toFixed(4)}`],
-      ["Steps", `${totalSteps}`],
-      ["Model", modelName],
-    ],
-  });
+  const content = [
+    `${chalk.hex("#9CA3AF")("Tokens")}  ${chalk.white.bold(total.toLocaleString())}  ${chalk.dim(`(in: ${totalInput.toLocaleString()}  out: ${totalOutput.toLocaleString()})`)}`,
+    `${chalk.hex("#9CA3AF")("Steps")}   ${chalk.hex("#7C6FFF").bold(`${totalSteps}`)}`,
+    `${chalk.hex("#9CA3AF")("Cost")}    ${chalk.green.bold(`$${totalCost.toFixed(4)}`)}`,
+    `${chalk.hex("#9CA3AF")("Model")}   ${chalk.dim(modelName)}`,
+  ].join("\n");
+  printBox(content, { title: "Journey Summary", titleAlignment: "left", padding: { left: 2, right: 2, top: 0, bottom: 0 } });
   console.log();
 }
 

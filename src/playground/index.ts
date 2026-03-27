@@ -23,8 +23,9 @@ import { classifyInstruction } from "../flow/llm-parser.js";
 import { visionExecute } from "../flow/vision-execute.js";
 import type { FlowStep, FlowMeta } from "../flow/types.js";
 import type { MCPClient } from "../mcp/types.js";
-import { theme, printBox, printPanel, printTable, hr, appGradient, printMarkdown } from "../ui/terminal.js";
+import { theme, printBox, printPanel, printTable, hr, appGradient, printMarkdown, progressBar } from "../ui/terminal.js";
 import * as ui from "../ui/terminal.js";
+import Table from "cli-table3";
 
 import {
   executeStep,
@@ -95,21 +96,22 @@ function stepToDisplay(step: FlowStep, index: number): string {
 }
 
 function printStepResult(stepNum: number, step: FlowStep, success: boolean, message: string): void {
-  const num = theme.brand.bold(`${stepNum}`);
   const action = stepAction(step);
   const target = stepTarget(step);
   const icon = success ? theme.success("✓") : theme.error("✗");
-  const msgColor = success ? theme.dim : theme.error;
 
-  // Line 1: step number + action badge + target
   const actionBadge = success
     ? chalk.bgHex("#7C6FFF").white.bold(` ${action} `)
     : chalk.bgRed.white.bold(` ${action} `);
-  console.log(`  ${icon} ${num}  ${actionBadge} ${theme.white(target)}`);
 
-  // Line 2: result detail
+  const statusDot = success
+    ? chalk.green("●")
+    : chalk.red("●");
+
+  // Compact single block
+  console.log(`  ${icon} ${theme.dim(`#${stepNum}`)} ${actionBadge} ${theme.white(target)}`);
   if (message) {
-    console.log(`       ${msgColor(message)}`);
+    console.log(`    ${statusDot} ${success ? theme.success(message) : theme.error(message)}`);
   }
 }
 
@@ -171,15 +173,44 @@ function printStepList(): void {
       ? state.meta.appId
       : "Flow";
 
-  const stepLines = state.steps.map((step, i) => stepToDisplay(step, i));
-  const content = [
-    ...stepLines,
-    "",
-    theme.dim(`${state.steps.length} step${state.steps.length === 1 ? "" : "s"}`),
-  ].join("\n");
+  const table = new Table({
+    head: [
+      chalk.hex("#9CA3AF")("#"),
+      chalk.hex("#9CA3AF")("Action"),
+      chalk.hex("#9CA3AF")("Target"),
+      chalk.hex("#9CA3AF")("Status"),
+    ],
+    style: { head: [], border: ["gray"] },
+    chars: {
+      "top": "─", "top-mid": "┬", "top-left": "╭", "top-right": "╮",
+      "bottom": "─", "bottom-mid": "┴", "bottom-left": "╰", "bottom-right": "╯",
+      "left": "│", "left-mid": "├", "mid": "─", "mid-mid": "┼",
+      "right": "│", "right-mid": "┤", "middle": "│",
+    },
+    colWidths: [5, 10, 40, 10],
+    wordWrap: true,
+  });
+
+  for (let i = 0; i < state.steps.length; i++) {
+    const step = state.steps[i];
+    const action = stepAction(step);
+    const target = stepTarget(step);
+    const actionColored = chalk.hex("#6CB6FF").bold(action);
+    const statusColored = chalk.green("● pass");
+
+    table.push([
+      chalk.hex("#7C6FFF")(`${i + 1}`),
+      actionColored,
+      chalk.white(target),
+      statusColored,
+    ]);
+  }
 
   console.log();
-  printPanel({ title, content });
+  console.log(`  ${chalk.hex("#7C6FFF").bold(title)}`);
+  console.log(`  ${table.toString().split("\n").join("\n  ")}`);
+  console.log();
+  console.log(`  ${chalk.green("✓")} ${chalk.green.bold(`${state.steps.length}`)} ${chalk.dim(`step${state.steps.length === 1 ? "" : "s"} recorded`)}  ${progressBar(state.steps.length, state.steps.length, 15)}`);
   console.log();
 }
 
@@ -236,10 +267,14 @@ const COMMANDS: Record<string, { desc: string; run: (arg: string) => Promise<voi
       const filepath = filename.startsWith("/") ? filename : path.resolve(process.cwd(), filename);
       const yamlStr = buildYamlString();
       writeFileSync(filepath, yamlStr, "utf-8");
+      const exportContent = [
+        `${chalk.green.bold(`${state.steps.length}`)} ${chalk.dim("steps exported")}`,
+        "",
+        `${chalk.dim("File:")} ${chalk.white(filepath)}`,
+        `${chalk.dim("Run:")}  ${chalk.cyan(`appclaw --flow ${path.relative(process.cwd(), filepath)}`)}`,
+      ].join("\n");
       console.log();
-      console.log(`  ${theme.success("✓")} ${theme.success.bold("Exported")} ${state.steps.length} steps`);
-      console.log(`    ${theme.dim("→")} ${theme.muted(filepath)}`);
-      console.log(`    ${theme.dim("Run with:")} ${theme.info(`appclaw --flow ${path.relative(process.cwd(), filepath)}`)}`);
+      printBox(exportContent, { title: "Exported", titleAlignment: "left", borderColor: "#22C55E" });
       console.log();
     },
   },
