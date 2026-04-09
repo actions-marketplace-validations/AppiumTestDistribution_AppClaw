@@ -550,10 +550,7 @@ async function visionAssert(mcp: MCPClient, text: string): Promise<boolean> {
     disableThinking: true,
   });
 
-  // Let the LLM interpret the query naturally — it should check for both
-  // literal text AND semantic meaning (e.g. "search results" means the screen
-  // is showing results, not that the exact words "search results" appear).
-  const query = `Check if "${text}" is satisfied on this screen. This could mean: (1) the exact text "${text}" is literally visible, OR (2) the screen visually shows what "${text}" describes (e.g. "search results" means a list of results is displayed, "login page" means a login form is shown). Use your judgment — if it reads like a description of screen state, check the overall content and layout rather than looking for exact text.`;
+  const query = `Is "${text}" visible or present on this screen?`;
 
   // Single attempt — callers (waitUntilCondition, assertTextVisible) handle retrying
   const maxAttempts = 1;
@@ -564,11 +561,13 @@ async function visionAssert(mcp: MCPClient, text: string): Promise<boolean> {
       ui.printAgentBullet(
         `[vision-assert] Taking screenshot for: "${text}"${attempt > 0 ? ` (retry ${attempt})` : ''}`
       );
-    const imageBase64 = await screenshot(mcp);
-    if (!imageBase64) {
+    const rawImage = await screenshot(mcp);
+    if (!rawImage) {
       if (mcpDebug) ui.printWarning('[vision-assert] Failed to capture screenshot');
       continue;
     }
+    const { downscaleForVision } = await import('./vision-execute.js');
+    const imageBase64 = await downscaleForVision(rawImage);
     if (mcpDebug)
       ui.printAgentBullet(
         `[vision-assert] Screenshot captured (${Math.round(imageBase64.length / 1024)}KB)`

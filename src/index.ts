@@ -560,7 +560,7 @@ async function main() {
     // ══════════════════════════════════════════════════════════════════
     let parsed;
     try {
-      parsed = await parseFlowYamlFile(cliArgs.flow, bindings ? { bindings } : {});
+      parsed = await parseFlowYamlFile(cliArgs.flow, { ...(bindings ? { bindings } : {}), strict: true });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       emitJson({ event: 'error', data: { message: `Invalid flow YAML: ${msg}` } });

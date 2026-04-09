@@ -210,9 +210,9 @@ export function normalizeStructured(raw: unknown, index: number): FlowStep | nul
   throw new Error(`Step ${index + 1}: invalid step (expected string or single-key object)`);
 }
 
-// ── Raw step parsing (with LLM fallback) ───────────────────────────
+// ── Raw step parsing (with optional LLM fallback) ──────────────────
 
-async function parseRawSteps(rawSteps: unknown[]): Promise<FlowStep[]> {
+async function parseRawSteps(rawSteps: unknown[], strict?: boolean): Promise<FlowStep[]> {
   const steps: FlowStep[] = [];
   for (let i = 0; i < rawSteps.length; i++) {
     const structured = normalizeStructured(rawSteps[i], i);
@@ -220,6 +220,12 @@ async function parseRawSteps(rawSteps: unknown[]): Promise<FlowStep[]> {
       steps.push(structured);
     } else {
       const instruction = String(rawSteps[i]).trim();
+      if (strict) {
+        throw new Error(
+          `Step ${i + 1}: unrecognized instruction "${instruction}". ` +
+            `Fix the YAML or remove --strict to allow LLM fallback.`
+        );
+      }
       const resolved = await resolveNaturalStep(instruction);
       steps.push(resolved);
     }
@@ -335,6 +341,12 @@ function extractPhasedOrFlat(meta: FlowMeta, obj: Record<string, unknown>): RawE
 export interface ParseOptions {
   /** Variable bindings to interpolate. If omitted, no interpolation. */
   bindings?: VariableBindings;
+  /**
+   * When true, throw an error instead of falling back to the LLM for
+   * unrecognized steps. Use in --flow mode so bad YAML fails fast rather
+   * than silently being fixed at runtime.
+   */
+  strict?: boolean;
 }
 
 export async function parseFlowYamlString(
@@ -354,6 +366,7 @@ export async function parseFlowYamlString(
 
   const raw = extractRaw(docs);
   const bindings = options.bindings ?? emptyBindings();
+  const { strict } = options;
 
   // ── Phased format ──
   if (raw.rawSetup || raw.rawMain || raw.rawAssertions) {
@@ -361,7 +374,7 @@ export async function parseFlowYamlString(
     const allSteps: FlowStep[] = [];
 
     if (raw.rawSetup) {
-      const setupSteps = await parseRawSteps(raw.rawSetup);
+      const setupSteps = await parseRawSteps(raw.rawSetup, strict);
       for (const s of setupSteps) {
         const resolved = interpolateStep(s as Record<string, unknown>, bindings) as FlowStep;
         phases.push({ step: resolved, phase: 'setup' });
@@ -370,7 +383,7 @@ export async function parseFlowYamlString(
     }
 
     if (raw.rawMain) {
-      const mainSteps = await parseRawSteps(raw.rawMain);
+      const mainSteps = await parseRawSteps(raw.rawMain, strict);
       for (const s of mainSteps) {
         const resolved = interpolateStep(s as Record<string, unknown>, bindings) as FlowStep;
         phases.push({ step: resolved, phase: 'test' });
@@ -379,13 +392,9 @@ export async function parseFlowYamlString(
     }
 
     if (raw.rawAssertions) {
-      const assertSteps = await parseRawSteps(raw.rawAssertions);
+      const assertSteps = await parseRawSteps(raw.rawAssertions, strict);
       for (const s of assertSteps) {
         const resolved = interpolateStep(s as Record<string, unknown>, bindings) as FlowStep;
-        // Wrap plain text assertions: if a step came through as a tap/type/etc but
-        // it's in the assertions section, leave it. If it's a raw string that parsed
-        // as something other than assert, keep it — the user may want to do actions
-        // in assertions. But if it didn't parse (and was LLM-resolved), trust the LLM.
         phases.push({ step: resolved, phase: 'assertion' });
         allSteps.push(resolved);
       }
@@ -399,7 +408,7 @@ export async function parseFlowYamlString(
     throw new Error('Flow steps must be a YAML array');
   }
 
-  const steps = await parseRawSteps(raw.rawSteps);
+  const steps = await parseRawSteps(raw.rawSteps, strict);
   const resolvedSteps = steps.map(
     (s) => interpolateStep(s as Record<string, unknown>, bindings) as FlowStep
   );

@@ -463,7 +463,7 @@ export async function runSuite(
     for (const flowFile of suite.flows) {
       let parsed: ParsedFlow;
       try {
-        parsed = await parseFlowYamlFile(flowFile);
+        parsed = await parseFlowYamlFile(flowFile, { strict: true });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         throw new Error(`Failed to parse suite flow "${flowFile}": ${msg}`);

@@ -198,6 +198,20 @@ function printStepFail(stepNum: number, step: FlowStep, message: string): void {
   printStepResult(stepNum, step, false, message);
 }
 
+/**
+ * Minimum matchScore (1-10) required to execute a tap in the playground.
+ * Below this threshold, vision found a loose match — show suggestion but don't execute.
+ */
+const MIN_MATCH_SCORE = 7;
+
+/**
+ * Build a helpful suggestion when a tap is not found or matched loosely.
+ */
+function buildVisionSuggestion(instruction: string, resolvedLabel: string): string | null {
+  if (!resolvedLabel || resolvedLabel === instruction) return null;
+  return `Closest match: "${resolvedLabel}". Try: tap on ${resolvedLabel}`;
+}
+
 /** Convert step to YAML — preserve the user's original natural language input. */
 function stepToYaml(step: FlowStep): unknown {
   // Playground steps always have verbatim (the exact text the user typed).
@@ -920,7 +934,7 @@ export async function runPlaygroundJson(deviceArgs?: PlaygroundDeviceArgs): Prom
     // Vision mode execution
     if (state.mcp && Config.AGENT_MODE === 'vision') {
       try {
-        const vResult = await visionExecute(state.mcp, line);
+        const vResult = await visionExecute(state.mcp, line, undefined, undefined, { minMatchScore: MIN_MATCH_SCORE });
         if (vResult) {
           if (vResult.isGetInfo) {
             emitJson({
@@ -938,7 +952,9 @@ export async function runPlaygroundJson(deviceArgs?: PlaygroundDeviceArgs): Prom
           }
           if (vResult.result.message === '__needs_executeStep__') {
             const execResult = await runStepOnDevice(vResult.step);
-            if (execResult.success) state.steps.push(vResult.step);
+            if (execResult.success) {
+              state.steps.push(vResult.step);
+            }
             emitJson({
               event: 'step',
               data: {
@@ -952,7 +968,13 @@ export async function runPlaygroundJson(deviceArgs?: PlaygroundDeviceArgs): Prom
             processing = false;
             return;
           }
-          if (vResult.result.success) state.steps.push(vResult.step);
+          if (vResult.result.success) {
+            state.steps.push(vResult.step);
+          }
+          const suggestion =
+            !vResult.result.success && vResult.step.kind === 'tap'
+              ? buildVisionSuggestion(line, vResult.step.label ?? '')
+              : null;
           emitJson({
             event: 'step',
             data: {
@@ -960,7 +982,9 @@ export async function runPlaygroundJson(deviceArgs?: PlaygroundDeviceArgs): Prom
               action: vResult.step.kind,
               target: line,
               success: vResult.result.success,
-              message: vResult.result.message,
+              message: suggestion
+                ? `${vResult.result.message}\n${suggestion}`
+                : vResult.result.message,
             },
           });
           processing = false;
@@ -1018,7 +1042,9 @@ export async function runPlaygroundJson(deviceArgs?: PlaygroundDeviceArgs): Prom
 
     try {
       const result = await runStepOnDevice(parsed);
-      if (result.success) state.steps.push(parsed);
+      if (result.success) {
+        state.steps.push(parsed);
+      }
       emitJson({
         event: 'step',
         data: {
@@ -1247,7 +1273,7 @@ async function processLine(line: string): Promise<void> {
   if (state.mcp && Config.AGENT_MODE === 'vision') {
     try {
       ui.startSpinner('Executing', line);
-      const vResult = await visionExecute(state.mcp, line);
+      const vResult = await visionExecute(state.mcp, line, undefined, undefined, { minMatchScore: MIN_MATCH_SCORE });
       ui.stopSpinner();
 
       if (vResult) {
@@ -1272,6 +1298,7 @@ async function processLine(line: string): Promise<void> {
             printStepSuccess(stepNum, vResult.step, execResult.message);
           } else {
             printStepFail(stepNum, vResult.step, execResult.message);
+            console.log(`    ${theme.dim('Step not recorded. Fix and try again.')}`);
           }
           return;
         }
@@ -1281,7 +1308,14 @@ async function processLine(line: string): Promise<void> {
           state.steps.push(vResult.step);
           printStepSuccess(stepNum, vResult.step, vResult.result.message);
         } else {
+          const suggestion =
+            vResult.step.kind === 'tap'
+              ? buildVisionSuggestion(line, vResult.step.label ?? '')
+              : null;
           printStepFail(stepNum, vResult.step, vResult.result.message);
+          if (suggestion) {
+            console.log(`    ${theme.warn(suggestion)}`);
+          }
           console.log(`    ${theme.dim('Step not recorded. Fix and try again.')}`);
         }
         return;

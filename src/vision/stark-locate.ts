@@ -140,7 +140,11 @@ export async function starkLocateTapTarget(
   for (const action of actions) {
     for (const locator of action.locators ?? []) {
       const coords = locator.coordinates;
-      if (coords && coords.length >= 2 && !(coords[0] === 0 && coords[1] === 0)) {
+      if (coords && coords.length >= 2) {
+        if (coords[0] === 0 && coords[1] === 0) {
+          // [0, 0] is the prompt contract signal for "element not found" — do not fall back to getBoundingBox
+          continue;
+        }
         const bbox = scaleCoordinates(coords as [number, number], screenSize);
         const { x, y } = bbox.center;
         return {

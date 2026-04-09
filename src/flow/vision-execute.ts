@@ -217,7 +217,7 @@ function preCheck(instruction: string): PreCheckResult | null {
     if (query) return { step: { kind: 'openApp', query, verbatim: t } };
   }
 
-  // 3. wait/pause/sleep
+  // 3. wait/pause/sleep (fixed duration)
   const waitMatch = t.match(
     /^(?:wait|sleep|pause)(?:\s+(?:for\s+)?(\d+(?:\.\d+)?)\s*(s|sec|seconds|ms)?)?$/i
   );
@@ -226,6 +226,33 @@ function preCheck(instruction: string): PreCheckResult | null {
     const unit = (waitMatch[2] ?? 's').toLowerCase();
     const seconds = unit.startsWith('m') ? n / 1000 : n;
     return { step: { kind: 'wait', seconds, verbatim: t } };
+  }
+
+  // 3b. waitUntil — "wait for X", "wait until X is visible/gone", "wait until screen is loaded"
+  // Optional leading timeout: "wait 10s until X is visible"
+  const timeoutPrefix = t.match(/^wait\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:onds?)?)?\s+until\s+/i);
+  const timeoutSeconds = timeoutPrefix ? Number(timeoutPrefix[1]) : 15;
+  const waitBody = timeoutPrefix ? t.slice(timeoutPrefix[0].length - 1) : t; // body after optional "wait Ns"
+
+  if (/^wait\s+(?:\d+\s*s(?:ec(?:onds?)?)?\s+)?until\s+screen\s+(?:is\s+)?(?:loaded|ready|done|finished)$/i.test(t)) {
+    return { step: { kind: 'waitUntil', condition: 'screenLoaded', timeoutSeconds, verbatim: t } };
+  }
+  const waitUntilGone = (waitBody).match(
+    /^(?:wait\s+until|wait\s+for)\s+["']?(.+?)["']?\s+(?:is\s+)?(?:gone|hidden|dismissed|disappears?)\.?$/i
+  );
+  if (waitUntilGone) {
+    const text = waitUntilGone[1].trim();
+    return { step: { kind: 'waitUntil', condition: 'gone', text, timeoutSeconds, verbatim: t } };
+  }
+  const waitUntilVisible = (waitBody).match(
+    /^(?:wait\s+until|wait\s+for)\s+["']?(.+?)["']?(?:\s+(?:is\s+)?(?:visible|present|shown|displayed|there|appears?))?\.?$/i
+  );
+  if (waitUntilVisible) {
+    const text = waitUntilVisible[1].trim();
+    // Exclude bare "wait for Ns" (already handled above) and very short strings
+    if (text && !/^\d+(?:\.\d+)?\s*(?:s|sec|seconds|ms)?$/i.test(text)) {
+      return { step: { kind: 'waitUntil', condition: 'visible', text, timeoutSeconds, verbatim: t } };
+    }
   }
 
   // 4. done
@@ -282,6 +309,13 @@ export interface VisionExecuteResult {
   /** The answer for getInfo queries. */
   getInfoAnswer?: string;
   getInfoExplanation?: string;
+  /**
+   * How directly the user's instruction described the located element (1–10).
+   * Comes from the LLM's matchScore in the combinedInstructionPrompt response.
+   * Low score = instruction was vague/sloppy → playground should refine the YAML verbatim.
+   * High score = instruction was intentional/accurate → keep as-is.
+   */
+  matchScore?: number;
 }
 
 /**
@@ -295,7 +329,8 @@ export async function visionExecute(
   mcp: MCPClient,
   instruction: string,
   appResolver?: { resolve?: (query: string) => string | null },
-  deviceUdid?: string
+  deviceUdid?: string,
+  options?: { minMatchScore?: number }
 ): Promise<VisionExecuteResult | null> {
   lastVisionScreenshot = null; // Clear before each call
   const apiKey = getStarkVisionApiKey();
@@ -304,8 +339,8 @@ export async function visionExecute(
   // ── Pre-check: non-visual instructions ──
   const pre = preCheck(instruction);
   if (pre?.step) {
-    // scrollAssert needs executeStep (which has scrollUntilVisible logic)
-    if (pre.step.kind === 'scrollAssert') {
+    // scrollAssert and waitUntil need executeStep for their polling/scroll logic
+    if (pre.step.kind === 'scrollAssert' || pre.step.kind === 'waitUntil') {
       return { step: pre.step, result: { success: false, message: '__needs_executeStep__' } };
     }
     // Other pre-check steps — let caller fall through to classifyInstruction → executeStep
@@ -621,7 +656,21 @@ export async function visionExecute(
   // Tap/click (default for most actions)
   if (TAP_ACTIONS.has(actionName) || locators.length > 0) {
     const label = locators[0]?.element || instruction;
+    const matchScore: number | undefined = locators[0]?.matchScore;
     const step: FlowStep = { kind: 'tap', label, verbatim: instruction };
+
+    // Reject loose matches before touching the device
+    if (
+      options?.minMatchScore !== undefined &&
+      matchScore !== undefined &&
+      matchScore < options.minMatchScore
+    ) {
+      return {
+        step,
+        result: { success: false, message: `Element not found for "${instruction}".` },
+        matchScore,
+      };
+    }
 
     // Try coordinates from first locator
     for (const locator of locators) {
@@ -637,6 +686,7 @@ export async function visionExecute(
               success: true,
               message: `Tapped "${label}" at [${Math.round(x)}, ${Math.round(y)}]`,
             },
+            matchScore,
           };
         }
       }
@@ -660,6 +710,7 @@ export async function visionExecute(
                   success: true,
                   message: `Tapped "${label}" at [${Math.round(x)}, ${Math.round(y)}] (bbox)`,
                 },
+                matchScore,
               };
             }
           }
@@ -670,6 +721,7 @@ export async function visionExecute(
     return {
       step,
       result: { success: false, message: `Could not locate "${label}" on screen` },
+      matchScore,
     };
   }
 
