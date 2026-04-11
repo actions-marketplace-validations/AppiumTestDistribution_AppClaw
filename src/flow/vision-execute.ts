@@ -19,7 +19,12 @@ import type { MCPClient } from '../mcp/types.js';
 import type { FlowStep } from './types.js';
 import type { ActionResult } from '../llm/schemas.js';
 import { screenshot } from '../mcp/tools.js';
-import { getStarkVisionApiKey, getStarkVisionModel } from '../vision/locate-enabled.js';
+import {
+  getStarkVisionApiKey,
+  getStarkVisionBaseUrl,
+  getStarkVisionCoordinateOrder,
+  getStarkVisionModel,
+} from '../vision/locate-enabled.js';
 import { getScreenSizeForStark } from '../vision/window-size.js';
 import { tapAtCoordinates } from '../agent/element-finder.js';
 import { detectDeviceUdid, typeViaKeyboard, typeViaSetValue } from '../mcp/keyboard.js';
@@ -144,6 +149,68 @@ function parseJsonLenient(text: string): unknown {
   throw new Error('JSON parse failed');
 }
 
+/**
+ * Extract a proximity anchor from an instruction, e.g. "next to logout" → "logout".
+ * Returns null if no proximity reference found.
+ */
+function extractProximityAnchor(instruction: string): string | null {
+  const m = instruction.match(
+    /\b(?:next to|near|beside|adjacent to|right of|left of)\s+([a-z0-9 _'-]+?)(?:\s*$|\s+(?:button|icon|tab|link|text|label|field))/i
+  );
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Ask the vision model what element on screen is closest to the failed instruction.
+ * Returns null on error or if no useful answer found.
+ */
+async function getClosestMatchFromVision(
+  client: {
+    getElementInfo: (img: string, instruction: string, withExplanation: boolean) => Promise<string>;
+  },
+  imageBase64: string,
+  instruction: string
+): Promise<string | null> {
+  try {
+    const raw = await client.getElementInfo(
+      imageBase64,
+      `What element visible on screen is most similar to what the user wanted: "${instruction}"? Reply with just the element name/label, nothing else.`,
+      false
+    );
+    const cleaned = raw
+      .trim()
+      .replace(/(^```json\s*|```\s*$)/g, '')
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    const answer: string = parsed?.answer || '';
+    return answer.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if an anchor element is visible on screen using the vision model.
+ * Returns true if visible, true on error (fail-open to avoid blocking valid taps).
+ */
+async function anchorVisibleInVision(
+  client: { isElementVisible: (img: string, instruction: string) => Promise<string> },
+  imageBase64: string,
+  anchor: string
+): Promise<boolean> {
+  try {
+    const raw = await client.isElementVisible(imageBase64, anchor);
+    const cleaned = raw
+      .trim()
+      .replace(/(^```json\s*|```\s*$)/g, '')
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    return parsed?.conditionSatisfied !== false;
+  } catch {
+    return true; // fail-open
+  }
+}
+
 /** Actions from combinedInstructionPrompt that map to tap/click. */
 const TAP_ACTIONS = new Set(['click', 'tap', 'touch', 'select', 'long press', 'longpress']);
 
@@ -234,24 +301,30 @@ function preCheck(instruction: string): PreCheckResult | null {
   const timeoutSeconds = timeoutPrefix ? Number(timeoutPrefix[1]) : 15;
   const waitBody = timeoutPrefix ? t.slice(timeoutPrefix[0].length - 1) : t; // body after optional "wait Ns"
 
-  if (/^wait\s+(?:\d+\s*s(?:ec(?:onds?)?)?\s+)?until\s+screen\s+(?:is\s+)?(?:loaded|ready|done|finished)$/i.test(t)) {
+  if (
+    /^wait\s+(?:\d+\s*s(?:ec(?:onds?)?)?\s+)?until\s+screen\s+(?:is\s+)?(?:loaded|ready|done|finished)$/i.test(
+      t
+    )
+  ) {
     return { step: { kind: 'waitUntil', condition: 'screenLoaded', timeoutSeconds, verbatim: t } };
   }
-  const waitUntilGone = (waitBody).match(
+  const waitUntilGone = waitBody.match(
     /^(?:wait\s+until|wait\s+for)\s+["']?(.+?)["']?\s+(?:is\s+)?(?:gone|hidden|dismissed|disappears?)\.?$/i
   );
   if (waitUntilGone) {
     const text = waitUntilGone[1].trim();
     return { step: { kind: 'waitUntil', condition: 'gone', text, timeoutSeconds, verbatim: t } };
   }
-  const waitUntilVisible = (waitBody).match(
+  const waitUntilVisible = waitBody.match(
     /^(?:wait\s+until|wait\s+for)\s+["']?(.+?)["']?(?:\s+(?:is\s+)?(?:visible|present|shown|displayed|there|appears?))?\.?$/i
   );
   if (waitUntilVisible) {
     const text = waitUntilVisible[1].trim();
     // Exclude bare "wait for Ns" (already handled above) and very short strings
     if (text && !/^\d+(?:\.\d+)?\s*(?:s|sec|seconds|ms)?$/i.test(text)) {
-      return { step: { kind: 'waitUntil', condition: 'visible', text, timeoutSeconds, verbatim: t } };
+      return {
+        step: { kind: 'waitUntil', condition: 'visible', text, timeoutSeconds, verbatim: t },
+      };
     }
   }
 
@@ -316,6 +389,8 @@ export interface VisionExecuteResult {
    * High score = instruction was intentional/accurate → keep as-is.
    */
   matchScore?: number;
+  /** LLM-suggested closest visible element when the tap failed. */
+  closestMatch?: string;
 }
 
 /**
@@ -334,7 +409,9 @@ export async function visionExecute(
 ): Promise<VisionExecuteResult | null> {
   lastVisionScreenshot = null; // Clear before each call
   const apiKey = getStarkVisionApiKey();
-  if (!apiKey) return null; // No vision available
+  const baseUrl = getStarkVisionBaseUrl();
+  const coordinateOrder = getStarkVisionCoordinateOrder();
+  if (!apiKey && !baseUrl) return null; // No vision available
 
   // ── Pre-check: non-visual instructions ──
   const pre = preCheck(instruction);
@@ -358,9 +435,11 @@ export async function visionExecute(
       };
     }
     const client = new StarkVisionClient({
-      apiKey,
+      apiKey: apiKey || 'local',
       model: getStarkVisionModel(),
       disableThinking: true,
+      ...(baseUrl && { baseUrl }),
+      ...(baseUrl && { coordinateOrder }),
     });
     const t0 = performance.now();
     const response = await client.getElementInfo(imageBase64, pre.getInfoQuery, true);
@@ -395,9 +474,11 @@ export async function visionExecute(
       };
     }
     const client = new StarkVisionClient({
-      apiKey,
+      apiKey: apiKey || 'local',
       model: getStarkVisionModel(),
       disableThinking: true,
+      ...(baseUrl && { baseUrl }),
+      ...(baseUrl && { coordinateOrder }),
     });
     const visQuery = pre.assertQuery;
     const t0 = performance.now();
@@ -443,9 +524,10 @@ export async function visionExecute(
   // Use raw screenshot for screen size detection (need actual device pixels for tap coordinates)
   const screenSize = await getScreenSizeForStark(mcp, rawScreenshot);
   const client = new StarkVisionClient({
-    apiKey,
+    apiKey: apiKey || 'local',
     model: getStarkVisionModel(),
     disableThinking: true,
+    ...(baseUrl && { baseUrl }),
   });
 
   const t0 = performance.now();
@@ -672,6 +754,22 @@ export async function visionExecute(
       };
     }
 
+    // Verify proximity anchor is visible on screen before tapping
+    const proximityAnchor = extractProximityAnchor(instruction);
+    if (proximityAnchor) {
+      const anchorExists = await anchorVisibleInVision(client, imageBase64, proximityAnchor);
+      if (!anchorExists) {
+        return {
+          step,
+          result: {
+            success: false,
+            message: `Element not found for "${instruction}". Anchor "${proximityAnchor}" is not visible on screen.`,
+          },
+          matchScore,
+        };
+      }
+    }
+
     // Try coordinates from first locator
     for (const locator of locators) {
       const coords = locator.coordinates;
@@ -718,10 +816,12 @@ export async function visionExecute(
       }
     }
 
+    const closestMatch = await getClosestMatchFromVision(client, imageBase64, instruction);
     return {
       step,
       result: { success: false, message: `Could not locate "${label}" on screen` },
       matchScore,
+      closestMatch: closestMatch ?? undefined,
     };
   }
 
