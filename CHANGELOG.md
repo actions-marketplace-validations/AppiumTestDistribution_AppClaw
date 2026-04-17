@@ -1,3 +1,9 @@
+## [1.1.0](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.0.0...v1.1.0) (2026-04-17)
+
+### Features
+
+* add action.yml at repo root for GitHub Marketplace publishing ([#20](https://github.com/AppiumTestDistribution/AppClaw/issues/20)) ([c007399](https://github.com/AppiumTestDistribution/AppClaw/commit/c007399fa670273058cd51e65f0fd68323ccb3be))
+
 ## 1.0.0 (2026-04-16)
 
 ### Features
