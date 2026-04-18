@@ -1111,6 +1111,29 @@
             <li><a href="#sdk-options">Options Reference</a></li>
           </ul>
         </div>
+        <div class="sidebar-group open">
+          <button class="sidebar-heading" aria-expanded="true">
+            GitHub Actions
+            <svg
+              class="sidebar-chevron"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+          <ul>
+            <li><a href="#gha-overview">Overview</a></li>
+            <li><a href="#gha-quick-start">Quick Start</a></li>
+            <li><a href="#gha-inputs">Inputs</a></li>
+            <li><a href="#gha-secrets">Secrets Setup</a></li>
+            <li><a href="#gha-examples">Examples</a></li>
+            <li><a href="#gha-reports">Reports</a></li>
+            <li><a href="#gha-runners">Runner Requirements</a></li>
+          </ul>
+        </div>
       </aside>
 
       <!-- CONTENT -->
@@ -2928,6 +2951,315 @@ console<span class="p">.</span>log<span class="p">(</span><span class="s">'All f
   <span class="k">type</span> RunYamlFlowOptions <span class="c">// second arg to runFlow()</span>
 <span class="p">}</span> <span class="k">from</span> <span class="s">'appclaw'</span><span class="p">;</span></pre>
           </div>
+        </section>
+
+        <!-- ============================================ -->
+        <!-- GITHUB ACTIONS                               -->
+        <!-- ============================================ -->
+        <section id="gha-overview" class="reveal">
+          <h2>GitHub Actions</h2>
+          <p>
+            Run AppClaw mobile UI automation flows and AI-driven goals directly in GitHub Actions —
+            Android emulator or iOS simulator included, zero boilerplate.
+          </p>
+          <p>
+            Available on the
+            <a href="https://github.com/marketplace/actions/appclaw-mobile-tests" target="_blank">GitHub Marketplace</a>
+            as <strong>AppClaw Mobile Tests</strong>.
+          </p>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">workflow.yml</span>
+            </div>
+            <pre><span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+<span class="k">with:</span>
+  <span class="k">flow:</span> <span class="s">flows/login.yaml</span>
+  <span class="k">platform:</span> <span class="s">android</span>
+  <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span></pre>
+          </div>
+        </section>
+
+        <section id="gha-quick-start" class="reveal">
+          <h2>Quick Start</h2>
+
+          <h3>Android — run a YAML flow</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">android-flow.yml</span>
+            </div>
+            <pre><span class="k">name:</span> <span class="s">Mobile Tests</span>
+<span class="k">on:</span> <span class="p">[</span><span class="s">push</span><span class="p">,</span> <span class="s">pull_request</span><span class="p">]</span>
+
+<span class="k">jobs:</span>
+  <span class="k">test:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> <span class="s">actions/checkout@v4</span>
+
+      - <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+        <span class="k">with:</span>
+          <span class="k">flow:</span> <span class="s">flows/login.yaml</span>
+          <span class="k">platform:</span> <span class="s">android</span>
+          <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span></pre>
+          </div>
+
+          <h3>Android — natural language goal</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">android-goal.yml</span>
+            </div>
+            <pre>- <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+  <span class="k">with:</span>
+    <span class="k">goal:</span> <span class="s">'Open YouTube, search for Appium 3.0, verify the first result is visible'</span>
+    <span class="k">platform:</span> <span class="s">android</span>
+    <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span></pre>
+          </div>
+
+          <h3>iOS — run a YAML flow</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">ios-flow.yml</span>
+            </div>
+            <pre><span class="k">jobs:</span>
+  <span class="k">test:</span>
+    <span class="k">runs-on:</span> <span class="s">macos-14</span>  <span class="c"># iOS requires macOS (Apple Silicon)</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> <span class="s">actions/checkout@v4</span>
+
+      - <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+        <span class="k">with:</span>
+          <span class="k">flow:</span> <span class="s">flows/ios-login.yaml</span>
+          <span class="k">platform:</span> <span class="s">ios</span>
+          <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span></pre>
+          </div>
+        </section>
+
+        <section id="gha-inputs" class="reveal">
+          <h2>Inputs</h2>
+          <p>All inputs are passed via the <code>with:</code> block in your workflow.</p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Input</th>
+                <th>Required</th>
+                <th>Default</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>flow</code></td><td>one of*</td><td>—</td><td>Path to a YAML flow file relative to repo root</td></tr>
+              <tr><td><code>goal</code></td><td>one of*</td><td>—</td><td>Natural language goal executed by the LLM agent</td></tr>
+              <tr><td><code>platform</code></td><td>no</td><td><code>android</code></td><td>Target platform: <code>android</code> or <code>ios</code></td></tr>
+              <tr><td><code>provider</code></td><td>no</td><td><code>gemini</code></td><td>LLM provider: <code>gemini</code>, <code>anthropic</code>, <code>openai</code>, <code>groq</code></td></tr>
+              <tr><td><code>api-key</code></td><td><strong>yes</strong></td><td>—</td><td>LLM API key — stored as <code>LLM_API_KEY</code></td></tr>
+              <tr><td><code>model</code></td><td>no</td><td><em>provider default</em></td><td>LLM model ID to pin (e.g. <code>gemini-2.0-flash</code>)</td></tr>
+              <tr><td><code>agent-mode</code></td><td>no</td><td><code>dom</code></td><td><code>dom</code> (element locators) or <code>vision</code> (screenshot AI)</td></tr>
+              <tr><td><code>max-steps</code></td><td>no</td><td><code>30</code></td><td>Maximum agent steps before the run fails</td></tr>
+              <tr><td><code>step-delay</code></td><td>no</td><td><code>500</code></td><td>Milliseconds between steps</td></tr>
+              <tr><td><code>android-api-level</code></td><td>no</td><td><code>33</code></td><td>Android emulator API level (33 = Android 13)</td></tr>
+              <tr><td><code>android-profile</code></td><td>no</td><td><code>pixel_6</code></td><td>Android AVD hardware profile</td></tr>
+              <tr><td><code>android-target</code></td><td>no</td><td><code>default</code></td><td>Emulator target: <code>default</code> or <code>google_apis</code></td></tr>
+              <tr><td><code>cloud-provider</code></td><td>no</td><td><em>local</em></td><td>Cloud provider: <code>lambdatest</code>. Leave empty for local.</td></tr>
+              <tr><td><code>lambdatest-username</code></td><td>no**</td><td>—</td><td>LambdaTest account username</td></tr>
+              <tr><td><code>lambdatest-access-key</code></td><td>no**</td><td>—</td><td>LambdaTest access key</td></tr>
+              <tr><td><code>lambdatest-device-name</code></td><td>no**</td><td>—</td><td>Cloud device name (e.g. <code>Pixel 7</code>)</td></tr>
+              <tr><td><code>lambdatest-os-version</code></td><td>no**</td><td>—</td><td>Cloud OS version (e.g. <code>13</code>, <code>16</code>)</td></tr>
+              <tr><td><code>lambdatest-app</code></td><td>no</td><td>—</td><td>LambdaTest app ID (<code>lt://APP...</code>)</td></tr>
+              <tr><td><code>report</code></td><td>no</td><td><code>true</code></td><td>Upload HTML report as workflow artifact</td></tr>
+              <tr><td><code>report-name</code></td><td>no</td><td><code>appclaw-report</code></td><td>Name of the uploaded artifact</td></tr>
+              <tr><td><code>appclaw-version</code></td><td>no</td><td><code>latest</code></td><td>npm package version to pin</td></tr>
+            </tbody>
+          </table>
+          <p>* Provide either <code>flow</code> <strong>or</strong> <code>goal</code>, not both.</p>
+          <p>** Required when <code>cloud-provider: lambdatest</code>.</p>
+        </section>
+
+        <section id="gha-secrets" class="reveal">
+          <h2>Secrets Setup</h2>
+          <p>
+            Go to your repo &rarr; <strong>Settings &rarr; Secrets and variables &rarr; Actions &rarr; New repository secret</strong>:
+          </p>
+          <table>
+            <thead>
+              <tr><th>Secret name</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>LLM_API_KEY</code></td><td>Your API key — works for any provider (Gemini, Anthropic, OpenAI, Groq)</td></tr>
+              <tr><td><code>LT_USERNAME</code></td><td>LambdaTest username (only if using cloud devices)</td></tr>
+              <tr><td><code>LT_ACCESS_KEY</code></td><td>LambdaTest access key (only if using cloud devices)</td></tr>
+              <tr><td><code>LT_APP_ID</code></td><td>LambdaTest app ID (only if using cloud devices)</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="gha-examples" class="reveal">
+          <h2>Examples</h2>
+
+          <h3>Parallel matrix — run multiple flows concurrently</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">matrix-parallel.yml</span>
+            </div>
+            <pre><span class="k">jobs:</span>
+  <span class="k">test:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">strategy:</span>
+      <span class="k">fail-fast:</span> <span class="s">false</span>
+      <span class="k">matrix:</span>
+        <span class="k">flow:</span>
+          - <span class="s">flows/login.yaml</span>
+          - <span class="s">flows/search.yaml</span>
+          - <span class="s">flows/checkout.yaml</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> <span class="s">actions/checkout@v4</span>
+
+      - <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+        <span class="k">with:</span>
+          <span class="k">flow:</span> <span class="s">${{ matrix.flow }}</span>
+          <span class="k">platform:</span> <span class="s">android</span>
+          <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span>
+          <span class="k">report-name:</span> <span class="s">report-${{ strategy.job-index }}</span></pre>
+          </div>
+
+          <h3>LambdaTest cloud devices</h3>
+          <p>Run iOS tests on Ubuntu — no macOS runner needed.</p>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">lambdatest.yml</span>
+            </div>
+            <pre><span class="k">jobs:</span>
+  <span class="k">test:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> <span class="s">actions/checkout@v4</span>
+
+      - <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+        <span class="k">with:</span>
+          <span class="k">flow:</span> <span class="s">flows/ios-login.yaml</span>
+          <span class="k">platform:</span> <span class="s">ios</span>
+          <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span>
+          <span class="k">cloud-provider:</span> <span class="s">lambdatest</span>
+          <span class="k">lambdatest-username:</span> <span class="s">${{ secrets.LT_USERNAME }}</span>
+          <span class="k">lambdatest-access-key:</span> <span class="s">${{ secrets.LT_ACCESS_KEY }}</span>
+          <span class="k">lambdatest-device-name:</span> <span class="s">'iPhone 14'</span>
+          <span class="k">lambdatest-os-version:</span> <span class="s">'16'</span>
+          <span class="k">lambdatest-app:</span> <span class="s">${{ secrets.LT_APP_ID }}</span></pre>
+          </div>
+
+          <h3>Vision mode (screenshot-based AI)</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">vision-mode.yml</span>
+            </div>
+            <pre>- <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+  <span class="k">with:</span>
+    <span class="k">flow:</span> <span class="s">flows/onboarding.yaml</span>
+    <span class="k">platform:</span> <span class="s">android</span>
+    <span class="k">agent-mode:</span> <span class="s">vision</span>
+    <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span></pre>
+          </div>
+
+          <h3>Pin model for cost control</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">pin-model.yml</span>
+            </div>
+            <pre>- <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+  <span class="k">with:</span>
+    <span class="k">flow:</span> <span class="s">flows/smoke.yaml</span>
+    <span class="k">platform:</span> <span class="s">android</span>
+    <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span>
+    <span class="k">model:</span> <span class="s">'gemini-2.0-flash'</span>  <span class="c"># cheaper/faster than pro</span></pre>
+          </div>
+
+          <h3>Nightly regression on a schedule</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">nightly.yml</span>
+            </div>
+            <pre><span class="k">on:</span>
+  <span class="k">schedule:</span>
+    - <span class="k">cron:</span> <span class="s">'0 2 * * *'</span>  <span class="c"># 2 AM UTC every night</span>
+
+<span class="k">jobs:</span>
+  <span class="k">nightly:</span>
+    <span class="k">runs-on:</span> <span class="s">ubuntu-latest</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> <span class="s">actions/checkout@v4</span>
+      - <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+        <span class="k">with:</span>
+          <span class="k">flow:</span> <span class="s">flows/full-regression.yaml</span>
+          <span class="k">platform:</span> <span class="s">android</span>
+          <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span>
+          <span class="k">report-name:</span> <span class="s">nightly-report-${{ github.run_id }}</span></pre>
+          </div>
+        </section>
+
+        <section id="gha-reports" class="reveal">
+          <h2>Reports</h2>
+          <p>
+            When <code>report: true</code> (default), an HTML report is uploaded as a workflow artifact after each run.
+            Download it from the <strong>Actions run summary &rarr; Artifacts</strong>. The report includes:
+          </p>
+          <ul>
+            <li>Step-by-step screenshots with tap overlays</li>
+            <li>Pass/fail status per step</li>
+            <li>Execution timeline</li>
+            <li>Screen recording (if <code>video: true</code> is set in your flow)</li>
+          </ul>
+
+          <h3>Use report path in a downstream step</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">report-path.yml</span>
+            </div>
+            <pre>- <span class="k">uses:</span> <span class="s">AppiumTestDistribution/AppClaw@v1</span>
+  <span class="k">id:</span> <span class="s">appclaw</span>
+  <span class="k">with:</span>
+    <span class="k">flow:</span> <span class="s">flows/login.yaml</span>
+    <span class="k">platform:</span> <span class="s">android</span>
+    <span class="k">api-key:</span> <span class="s">${{ secrets.LLM_API_KEY }}</span>
+
+- <span class="k">name:</span> <span class="s">Print report location</span>
+  <span class="k">run:</span> <span class="s">echo "Report at ${{ steps.appclaw.outputs.report-path }}"</span></pre>
+          </div>
+        </section>
+
+        <section id="gha-runners" class="reveal">
+          <h2>Runner Requirements</h2>
+          <table>
+            <thead>
+              <tr><th>Platform</th><th>Runner</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>android</code></td>
+                <td><code>ubuntu-latest</code></td>
+                <td>Free tier. KVM-enabled. Emulator boots in ~4-6 min.</td>
+              </tr>
+              <tr>
+                <td><code>ios</code></td>
+                <td><code>macos-14</code></td>
+                <td>Apple Silicon. macOS minutes cost ~10x Linux.</td>
+              </tr>
+            </tbody>
+          </table>
+          <p>
+            <strong>iOS tip:</strong> For faster iOS CI, use LambdaTest cloud devices on <code>ubuntu-latest</code>
+            instead of a macOS runner.
+          </p>
         </section>
       </main>
     </div>
