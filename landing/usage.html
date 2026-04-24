@@ -1134,6 +1134,26 @@
             <li><a href="#gha-runners">Runner Requirements</a></li>
           </ul>
         </div>
+
+        <div class="sidebar-group open">
+          <button class="sidebar-heading" aria-expanded="true">
+            App Guides
+            <svg
+              class="sidebar-chevron"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+          <ul>
+            <li><a href="#appguide-overview">What are App Guides?</a></li>
+            <li><a href="#appguide-built-in">Built-in Guides</a></li>
+            <li><a href="#appguide-custom">Custom Guides</a></li>
+          </ul>
+        </div>
       </aside>
 
       <!-- CONTENT -->
@@ -3425,6 +3445,269 @@ console<span class="p">.</span>log<span class="p">(</span><span class="s">'All f
             instead of a macOS runner.
           </p>
         </section>
+
+        <!-- ============================================ -->
+        <!-- APP GUIDES                                   -->
+        <!-- ============================================ -->
+        <section id="appguide-overview" class="reveal">
+          <div class="section-breadcrumb">App Guides <span>/</span> Overview</div>
+          <h2>What are App Guides?</h2>
+          <p>
+            App Guides (AppGuides) are per-app knowledge snippets injected directly into the
+            agent's context window at the start of every automation run. They encode navigation
+            patterns, gesture shortcuts, and common action paths for a specific app — so the agent
+            never needs to rediscover them by trial and error.
+          </p>
+
+          <div class="callout callout-tip">
+            <div class="callout-title">Context Engineering for Mobile</div>
+            <p>
+              AppGuides are AppClaw's implementation of <strong>context engineering</strong> — the
+              practice of giving the LLM exactly the right knowledge to act correctly, rather than
+              relying on the model's general training alone. For mobile automation, this means
+              app-specific navigation knowledge baked into the system prompt before the agent ever
+              looks at the screen.
+            </p>
+          </div>
+
+          <h3>How it works</h3>
+          <p>
+            When AppClaw starts a run against a known app, it automatically loads the matching guide
+            and prepends it to the agent's system prompt with an
+            <code>APP_GUIDE (AppName):</code> prefix. The LLM sees this contextual knowledge before
+            it takes any action — making the first step decisive rather than exploratory.
+          </p>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">System prompt injection (simplified)</span>
+            </div>
+            <pre>APP_GUIDE (WhatsApp):
+
+## WhatsApp Navigation
+- Bottom tabs: Chats | Updates | Communities | Calls
+- New chat: floating pencil/message icon (bottom-right)
+- Search: magnifying-glass icon at the top of Chats
+
+## Messaging
+- Open a chat → type in the message bar at the bottom → send via arrow icon
+- Attach media: paperclip icon next to message bar
+- Voice note: long-press the microphone icon</pre>
+          </div>
+
+          <h3>Resolution order</h3>
+          <ol>
+            <li>
+              <strong>Custom guide</strong> —
+              <code>.appclaw/guides/&lt;appId&gt;.md</code> (highest priority, overrides built-ins)
+            </li>
+            <li><strong>Built-in guide</strong> — bundled guides for 10 common apps</li>
+            <li>
+              <strong>No guide</strong> — agent explores the app from scratch using only what it
+              sees on screen
+            </li>
+          </ol>
+        </section>
+
+        <section id="appguide-built-in" class="reveal">
+          <div class="section-breadcrumb">App Guides <span>/</span> Built-in Guides</div>
+          <h2>Built-in Guides</h2>
+          <p>
+            AppClaw ships with guides for the most commonly automated apps on both Android and iOS.
+            These activate automatically when AppClaw detects the matching package name or bundle ID.
+          </p>
+
+          <table class="cmd-table">
+            <thead>
+              <tr>
+                <th>App</th>
+                <th>Platform</th>
+                <th>App ID / Bundle ID</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Gmail</td>
+                <td>Android</td>
+                <td><code>com.google.android.gm</code></td>
+              </tr>
+              <tr>
+                <td>Gmail</td>
+                <td>iOS</td>
+                <td><code>com.google.gmail</code></td>
+              </tr>
+              <tr>
+                <td>YouTube</td>
+                <td>Android</td>
+                <td><code>com.google.android.youtube</code></td>
+              </tr>
+              <tr>
+                <td>YouTube</td>
+                <td>iOS</td>
+                <td><code>com.google.ios.youtube</code></td>
+              </tr>
+              <tr>
+                <td>WhatsApp</td>
+                <td>Android</td>
+                <td><code>com.whatsapp</code></td>
+              </tr>
+              <tr>
+                <td>WhatsApp</td>
+                <td>iOS</td>
+                <td><code>net.whatsapp.WhatsApp</code></td>
+              </tr>
+              <tr>
+                <td>Chrome</td>
+                <td>Android</td>
+                <td><code>com.android.chrome</code></td>
+              </tr>
+              <tr>
+                <td>Chrome</td>
+                <td>iOS</td>
+                <td><code>com.google.chrome</code></td>
+              </tr>
+              <tr>
+                <td>Settings</td>
+                <td>Android</td>
+                <td><code>com.android.settings</code></td>
+              </tr>
+              <tr>
+                <td>Settings</td>
+                <td>iOS</td>
+                <td><code>com.apple.Preferences</code></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <h3>Example: WhatsApp Guide</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">APP_GUIDE (WhatsApp)</span>
+            </div>
+            <pre>## WhatsApp Navigation
+- Bottom tabs: Chats | Updates | Communities | Calls
+- New chat: floating pencil/message icon (bottom-right)
+- Search: magnifying-glass icon at the top of Chats
+
+## Messaging
+- Open a chat → type in the message bar at the bottom → send via arrow icon
+- Attach media: paperclip icon next to message bar
+- Voice note: long-press the microphone icon
+- Emoji/stickers: smiley face icon on the left of message bar
+
+## Common Actions
+- Star a message: long-press message → star icon
+- Forward: long-press message → forward arrow
+- Delete: long-press message → trash icon
+- Group info: tap the group name at the top of the chat</pre>
+          </div>
+
+          <h3>Example: YouTube Guide</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">APP_GUIDE (YouTube)</span>
+            </div>
+            <pre>## YouTube Navigation
+- Bottom nav: Home | Shorts | + (upload) | Subscriptions | Library
+- Search: magnifying-glass icon (top-right)
+- Tap a video thumbnail to play; double-tap left/right to seek ±10 s
+
+## Searching
+- Tap the search icon → type query → press Enter or tap search icon again
+- Filter results: tap "Filters" after searching
+
+## Playback
+- Full screen: rotate device or tap the expand icon (bottom-right of player)
+- Quality: tap ⋮ inside player → Quality
+- Captions: tap CC icon inside player</pre>
+          </div>
+        </section>
+
+        <section id="appguide-custom" class="reveal">
+          <div class="section-breadcrumb">App Guides <span>/</span> Custom Guides</div>
+          <h2>Custom Guides</h2>
+          <p>
+            Add a guide for any app — or override a built-in — by dropping a Markdown file at
+            <code>.appclaw/guides/&lt;appId&gt;.md</code> in your project directory. Custom guides
+            always take priority over built-ins.
+          </p>
+
+          <div class="callout callout-tip">
+            <div class="callout-title">Custom guides always win</div>
+            <p>
+              If a custom guide exists for an app ID, it replaces the built-in entirely. To extend
+              a built-in guide, copy its contents into your custom file and add your own sections.
+            </p>
+          </div>
+
+          <h3>Creating a custom guide</h3>
+          <ol>
+            <li>
+              Find your app's package name (Android) or bundle ID (iOS). You can get this from the
+              <code>appId</code> field in your YAML flow, or by inspecting the device.
+            </li>
+            <li>Create the directory <code>.appclaw/guides/</code> in your project root.</li>
+            <li>Write a Markdown file named <code>&lt;appId&gt;.md</code>.</li>
+          </ol>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">.appclaw/guides/com.myapp.android.md</span>
+            </div>
+            <pre>## Main Navigation
+- Bottom tabs: Home | Search | Orders | Profile
+- Hamburger menu (top-left) → categories and account settings
+
+## Checkout Flow
+- Cart icon is always in the top-right corner
+- Tap "Proceed to Checkout" → select address → choose payment → Place Order
+- Apply coupon: tap "Have a coupon?" on the order summary screen
+
+## Product Search
+- Tap the search bar at the top; supports filters: Brand | Price | Rating
+- Long-press any product thumbnail to preview without navigating away</pre>
+          </div>
+
+          <p>
+            Once in place, AppClaw picks it up automatically — no code changes or restarts needed.
+          </p>
+
+          <h3>Tips for writing good guides</h3>
+          <table class="cmd-table">
+            <thead>
+              <tr>
+                <th>Do</th>
+                <th>Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Describe <em>where</em> things are, not what they say</td>
+                <td>UI labels change; positions are stable</td>
+              </tr>
+              <tr>
+                <td>List gestures explicitly ("swipe right to archive")</td>
+                <td>The agent can't infer non-obvious gestures from a screenshot</td>
+              </tr>
+              <tr>
+                <td>Use bullet points over prose</td>
+                <td>Every token counts — bullets are faster for the model to parse</td>
+              </tr>
+              <tr>
+                <td>Document multi-step paths (Settings → Account → Privacy)</td>
+                <td>Saves the agent multiple round-trips for deeply nested flows</td>
+              </tr>
+              <tr>
+                <td>Keep it short (under 500 tokens)</td>
+                <td>Guides are injected on every step — brevity reduces cost</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
       </main>
     </div>
 
@@ -3448,6 +3731,7 @@ console<span class="p">.</span>log<span class="p">(</span><span class="s">'All f
               <li><a href="index.html#features">Agent Mode</a></li>
               <li><a href="index.html#features">YAML Flows</a></li>
               <li><a href="index.html#features">Playground</a></li>
+              <li><a href="index.html#appguide">AppGuide</a></li>
               <li><a href="index.html#architecture">Architecture</a></li>
             </ul>
           </div>
