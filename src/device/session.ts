@@ -65,7 +65,10 @@ export async function createPlatformSession(
   }
 
   try {
-    const sessionResult = await mcp.callTool('create_session', args);
+    const sessionResult = await mcp.callTool('appium_session_management', {
+      action: 'create',
+      ...args,
+    });
     const resultText = extractText(sessionResult);
 
     if (resultText.toLowerCase().includes('error') || resultText.toLowerCase().includes('failed')) {
@@ -151,7 +154,10 @@ async function createLambdaTestSession(
   };
 
   try {
-    const sessionResult = await mcp.callTool('create_session', args);
+    const sessionResult = await mcp.callTool('appium_session_management', {
+      action: 'create',
+      ...args,
+    });
     const resultText = extractText(sessionResult);
 
     if (resultText.toLowerCase().includes('error') || resultText.toLowerCase().includes('failed')) {
@@ -214,7 +220,7 @@ async function detectScreenSize(mcp: MCPClient, platform: Platform): Promise<voi
 
   // Android / fallback: try device info
   try {
-    const result = await mcp.callTool('appium_mobile_get_device_info', {});
+    const result = await mcp.callTool('appium_mobile_device_info', {});
     const text = extractText(result);
 
     if (platform === 'android') {

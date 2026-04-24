@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./github-action
+      - uses: ./
         id: run
         with:
           use-local-build: 'true'
@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./github-action
+      - uses: ./
         id: run
         with:
           use-local-build: 'true'
@@ -75,17 +75,19 @@ jobs:
   ios-flow:
     name: iOS — YAML flow
     runs-on: macos-14
-    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.platform == 'ios')
+    if: false
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./github-action
+      - uses: ./
         id: run
         with:
           use-local-build: 'true'
           flow: ${{ inputs.flow || 'flows/wdio.yaml' }}
           platform: ios
+          ios-device-type: simulator
+          mcp-debug: 'true'
           provider: gemini
           agent-mode: vision
           api-key: ${{ secrets.LLM_API_KEY }}

@@ -90,7 +90,7 @@ async function discoverDevices(
   const args: Record<string, unknown> = { platform };
   if (platform === 'ios' && deviceType) args.iosDeviceType = deviceType;
 
-  const result = await mcp.callTool('select_platform', args);
+  const result = await mcp.callTool('select_device', args);
   const text = extractText(result);
   const devices = parseDeviceList(text, platform);
 
@@ -234,7 +234,10 @@ async function runWorkerJob(
     );
 
     try {
-      await scopedMcp.callTool('delete_session', { sessionId: deviceResult.sessionId });
+      await scopedMcp.callTool('appium_session_management', {
+        action: 'delete',
+        sessionId: deviceResult.sessionId,
+      });
     } catch {
       /* ignore */
     }
@@ -257,7 +260,10 @@ async function runWorkerJob(
     const message = err instanceof Error ? err.message : String(err);
     console.error(`${label} ${chalk.red('error')} — ${job.flowFile}: ${message}`);
     try {
-      await scopedMcp.callTool('delete_session', { sessionId: deviceResult.sessionId });
+      await scopedMcp.callTool('appium_session_management', {
+        action: 'delete',
+        sessionId: deviceResult.sessionId,
+      });
     } catch {
       /* ignore */
     }

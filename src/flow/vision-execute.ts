@@ -99,22 +99,51 @@ function parseJsonLenient(text: string): unknown {
     /* continue */
   }
 
+  // Repair: LLMs sometimes omit the closing quote on a JSON key name before ':',
+  // emitting  "key:[value]  instead of  "key":[value]
+  // The regex only fires at key positions (after '{' or ',') so it cannot corrupt
+  // string values that happen to contain a colon.
+  const repaired = cleaned.replace(/(?<=[{,]\s*)"([A-Za-z_][A-Za-z0-9_]*):/g, '"$1":');
+  try {
+    return JSON.parse(repaired);
+  } catch {
+    /* continue */
+  }
+
   // Lenient path: extract the first balanced JSON object/array substring.
+  // Build `starts` with string-context awareness so that '[' or '{' characters
+  // inside string values are not mistaken for the start of a JSON structure.
+  // (Without this, a malformed key like "key:[926,357] would cause the inner '[' to
+  // be treated as a start, and [926,357] would be returned instead of the real object.)
   const starts: number[] = [];
-  for (let i = 0; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (ch === '{' || ch === '[') starts.push(i);
+  {
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < repaired.length; i++) {
+      const ch = repaired[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = true;
+        continue;
+      }
+      if (ch === '{' || ch === '[') starts.push(i);
+    }
   }
 
   for (const start of starts) {
-    const open = cleaned[start];
+    const open = repaired[start];
     const close = open === '{' ? '}' : ']';
     let depth = 0;
     let inString = false;
     let escaped = false;
 
-    for (let i = start; i < cleaned.length; i++) {
-      const ch = cleaned[i];
+    for (let i = start; i < repaired.length; i++) {
+      const ch = repaired[i];
 
       if (inString) {
         if (escaped) {
@@ -136,7 +165,7 @@ function parseJsonLenient(text: string): unknown {
       if (ch === close) depth--;
 
       if (depth === 0) {
-        const candidate = cleaned.slice(start, i + 1);
+        const candidate = repaired.slice(start, i + 1);
         try {
           return JSON.parse(candidate);
         } catch {
@@ -213,7 +242,10 @@ async function anchorVisibleInVision(
 }
 
 /** Actions from combinedInstructionPrompt that map to tap/click. */
-const TAP_ACTIONS = new Set(['click', 'tap', 'touch', 'select', 'long press', 'longpress']);
+const TAP_ACTIONS = new Set(['click', 'tap', 'touch', 'select']);
+
+/** Actions that map to long press. */
+const LONG_PRESS_ACTIONS = new Set(['long press', 'longpress', 'long-press', 'press and hold']);
 
 /** Actions that map to type/enter text. */
 const TYPE_ACTIONS = new Set(['enter', 'type', 'send', 'sendkeys', 'set', 'set value']);
@@ -350,6 +382,25 @@ function preCheck(instruction: string): PreCheckResult | null {
   );
   if (enterMatch) {
     return { step: { kind: 'enter', verbatim: t } };
+  }
+
+  // 5b. long press (natural language — route to longPress step kind)
+  const longPressMatch = t.match(
+    /^(?:long[\s-]press|long[\s-]tap|press\s+and\s+hold)(?:\s+on)?\s+(?:the\s+)?(.+?)(?:\s+for\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?))?$/i
+  );
+  if (longPressMatch) {
+    const label = longPressMatch[1].replace(/[.!?]+$/g, '').trim();
+    const durRaw = longPressMatch[2];
+    const durUnit = longPressMatch[3] ?? 'ms';
+    const duration = durRaw
+      ? durUnit.startsWith('s')
+        ? Math.round(Number(durRaw) * 1000)
+        : Math.round(Number(durRaw))
+      : undefined;
+    if (label)
+      return {
+        step: { kind: 'longPress', label, ...(duration != null ? { duration } : {}), verbatim: t },
+      };
   }
 
   // 6. Visibility assert — any instruction starting with an assert/verify verb,
@@ -616,10 +667,8 @@ export async function visionExecute(
 
     if (!hasElementCoords) {
       const step: FlowStep = { kind: 'swipe', direction, verbatim: instruction };
-      // appium_scroll only supports up/down; use appium_swipe for left/right
-      const scrollTool =
-        direction === 'left' || direction === 'right' ? 'appium_swipe' : 'appium_scroll';
-      await mcp.callTool(scrollTool, { direction });
+      const gestureAction = direction === 'left' || direction === 'right' ? 'swipe' : 'scroll';
+      await mcp.callTool('appium_gesture', { action: gestureAction, direction });
       return { step, result: { success: true, message: `Swiped ${direction}` } };
     }
     // Has element coords — fall through to element-targeted swipe below
@@ -859,6 +908,16 @@ export async function visionExecute(
           ? `Dragged "${step.from}" ${step.to ? `to "${step.to}"` : `(directional)`}`
           : `Drag failed: ${dragText.slice(0, 200)}`,
       },
+    };
+  }
+
+  // Long press — LLM classified this as "long press"
+  if (LONG_PRESS_ACTIONS.has(actionName)) {
+    const label = locators[0]?.element || instruction;
+    const step: FlowStep = { kind: 'longPress', label, verbatim: instruction };
+    return {
+      step,
+      result: { success: true, message: '__needs_executeStep__' },
     };
   }
 

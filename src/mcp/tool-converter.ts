@@ -39,11 +39,7 @@ export function convertMCPToolsToAITools(
 
 /** MCP tools the agent should never call directly */
 export const EXCLUDED_MCP_TOOLS = new Set([
-  'create_session',
-  'delete_session',
-  'list_sessions',
-  'selectSession',
-  'select_platform',
+  'appium_session_management',
   'select_device',
   'prepare_ios_simulator',
   // AI code-gen tools — not relevant to device control
@@ -51,6 +47,9 @@ export const EXCLUDED_MCP_TOOLS = new Set([
   'appium_generate_locators',
   'generate_tests',
   'generate_locators',
+  // Documentation/skills tools — not relevant to device control
+  'appium_documentation_query',
+  'appium_skills',
 ]);
 
 /** Additional tools to exclude in vision mode — DOM-based tools that distract the agent */

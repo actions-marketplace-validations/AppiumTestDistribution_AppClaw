@@ -44,7 +44,17 @@ export async function discoverAndSelectDevice(
   deviceName: string | null,
   forceDevicePicker: boolean = false
 ): Promise<DeviceSelection> {
-  // Step 1: Call select_platform to discover available devices
+  // Fast path: UDID already known — skip device enumeration entirely.
+  // select_device accepts deviceUdid directly and will bypass the slow list call.
+  if (udid && !forceDevicePicker) {
+    ui.startSpinner(`Selecting ${platform} device...`);
+    await selectDeviceOnMcp(mcp, platform, deviceType, udid);
+    ui.stopSpinner();
+    ui.printSetupOk(`Selected device ${udid}`);
+    return { device: { name: udid, udid }, platform, deviceType };
+  }
+
+  // Step 1: Call select_device to discover available devices
   ui.startSpinner(`Discovering ${platform} devices...`);
 
   const selectPlatformArgs: Record<string, unknown> = { platform };
@@ -52,7 +62,7 @@ export async function discoverAndSelectDevice(
     selectPlatformArgs.iosDeviceType = deviceType;
   }
 
-  const platformResult = await mcp.callTool('select_platform', selectPlatformArgs);
+  const platformResult = await mcp.callTool('select_device', selectPlatformArgs);
   const platformText = extractText(platformResult);
   ui.stopSpinner();
 
