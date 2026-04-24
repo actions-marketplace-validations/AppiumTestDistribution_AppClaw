@@ -1,3 +1,9 @@
+## [1.2.0](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.1.0...v1.2.0) (2026-04-24)
+
+### Features
+
+* Appguide support ([#22](https://github.com/AppiumTestDistribution/AppClaw/issues/22)) ([63e366f](https://github.com/AppiumTestDistribution/AppClaw/commit/63e366feeb1f36c22643fff8d015f5b3b1253f6c))
+
 ## [1.1.0](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.0.0...v1.1.0) (2026-04-17)
 
 ### Features
