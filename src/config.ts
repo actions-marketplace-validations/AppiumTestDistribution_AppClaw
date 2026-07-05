@@ -44,6 +44,12 @@ const envSchema = z.object({
   MCP_TRANSPORT: z.enum(['stdio', 'sse']).default('stdio'),
   MCP_HOST: z.string().default('localhost'),
   MCP_PORT: z.coerce.number().default(8080),
+  /**
+   * Full appium-mcp SSE URL. When set (transport 'sse') it takes precedence over
+   * MCP_HOST/MCP_PORT and preserves scheme + path — required for https tunnels
+   * (ngrok) and non-default ports. Empty string means "reconstruct from host:port".
+   */
+  MCP_URL: z.string().default(''),
 
   /**
    * Android UiAutomator2: appium:mjpegScreenshotUrl — MJPEG stream URL for faster screenshots.
@@ -194,36 +200,55 @@ const envSchema = z.object({
   RUN_SUMMARY_EVERY_N_STEPS: z.coerce.number().default(8),
 
   // ── Cloud provider ──────────────────────────────────────────────────────────
+  // Generic remote-Appium cloud support. AppClaw builds the hub URL + auth from
+  // the CLOUD_* creds below and routes the session through appium-mcp's
+  // `remoteServerUrl` path. Provider-specific capability namespaces
+  // (bstack:options / sauce:options / lt:options) are supplied via
+  // CAPABILITIES_FILE (`--caps`) — AppClaw stays agnostic about them.
 
-  /** Cloud provider for remote device execution. Empty = local (default). */
-  CLOUD_PROVIDER: z.enum(['', 'lambdatest']).default(''),
+  /**
+   * Cloud provider for remote device execution. Empty = local (default).
+   * Known providers get a built-in hub URL; `custom` requires CLOUD_SERVER_URL.
+   */
+  CLOUD_PROVIDER: z.enum(['', 'browserstack', 'saucelabs', 'lambdatest', 'custom']).default(''),
 
-  /** LambdaTest account username (required when CLOUD_PROVIDER=lambdatest). */
-  LAMBDATEST_USERNAME: z.string().default(''),
+  /** Cloud account username (required when CLOUD_PROVIDER is set, except `custom` with auth-in-URL). */
+  CLOUD_USERNAME: z.string().default(''),
 
-  /** LambdaTest access key (required when CLOUD_PROVIDER=lambdatest). */
-  LAMBDATEST_ACCESS_KEY: z.string().default(''),
+  /** Cloud access key / token (required when CLOUD_PROVIDER is set, except `custom` with auth-in-URL). */
+  CLOUD_ACCESS_KEY: z.string().default(''),
 
-  /** Cloud device name, e.g. "iPhone 14" (required when CLOUD_PROVIDER=lambdatest). */
-  LAMBDATEST_DEVICE_NAME: z.string().default(''),
+  /** Cloud device name, e.g. "iPhone 14" or "Samsung Galaxy S24" (required when CLOUD_PROVIDER is set). */
+  CLOUD_DEVICE_NAME: z.string().default(''),
 
-  /** Cloud OS version, e.g. "16" (required when CLOUD_PROVIDER=lambdatest). */
-  LAMBDATEST_OS_VERSION: z.string().default(''),
+  /** Cloud OS version, e.g. "16" or "14" (required when CLOUD_PROVIDER is set). */
+  CLOUD_OS_VERSION: z.string().default(''),
 
-  /** LambdaTest build label shown in the dashboard. */
-  LAMBDATEST_BUILD_NAME: z.string().default(''),
+  /**
+   * App to install on the cloud device. Format is provider-specific:
+   * BrowserStack `bs://…`, LambdaTest `lt://…`, Sauce Labs `storage:…`,
+   * or an HTTP(S) URL for `custom`. Passed as `appium:app`.
+   */
+  CLOUD_APP: z.string().default(''),
 
-  /** LambdaTest project label shown in the dashboard. */
-  LAMBDATEST_PROJECT_NAME: z.string().default(''),
+  /**
+   * Full Appium hub URL. Required when CLOUD_PROVIDER=custom (e.g. a self-hosted
+   * grid). Optional override for known providers. May embed auth
+   * (https://user:key@host/wd/hub); otherwise CLOUD_USERNAME/CLOUD_ACCESS_KEY are injected.
+   */
+  CLOUD_SERVER_URL: z.string().default(''),
 
-  /** Record session video on LambdaTest. Default: true. */
-  LAMBDATEST_VIDEO: z.enum(['true', 'false']).default('true'),
+  /**
+   * Data-center region for providers that have regional hubs (Sauce Labs).
+   * Default us-west-1. Ignored by providers without regions.
+   */
+  CLOUD_REGION: z.string().default('us-west-1'),
 
-  /** Capture network logs on LambdaTest. Default: false. */
-  LAMBDATEST_NETWORK: z.enum(['true', 'false']).default('false'),
+  /** Build label shown in the provider dashboard. Mapped into the provider's option namespace. */
+  CLOUD_BUILD_NAME: z.string().default(''),
 
-  /** LambdaTest app ID (lt://APP...) — the app to install and test on the cloud device. */
-  LAMBDATEST_APP: z.string().default(''),
+  /** Project label shown in the provider dashboard. Mapped into the provider's option namespace. */
+  CLOUD_PROJECT_NAME: z.string().default(''),
 });
 
 export type AppClawConfig = z.infer<typeof envSchema>;
@@ -231,17 +256,24 @@ export type AppClawConfig = z.infer<typeof envSchema>;
 export function loadConfig(overrides?: Record<string, string | undefined>): AppClawConfig {
   const env = overrides ? { ...process.env, ...overrides } : process.env;
   const config = envSchema.parse(env);
-  if (config.CLOUD_PROVIDER === 'lambdatest') {
-    if (!config.LAMBDATEST_USERNAME || !config.LAMBDATEST_ACCESS_KEY) {
+  if (config.CLOUD_PROVIDER) {
+    // `custom` can carry auth in CLOUD_SERVER_URL, so creds aren't strictly
+    // required there — but it MUST provide the hub URL. Known providers need creds.
+    if (config.CLOUD_PROVIDER === 'custom') {
+      if (!config.CLOUD_SERVER_URL) {
+        throw new Error('CLOUD_SERVER_URL is required when CLOUD_PROVIDER=custom');
+      }
+    } else if (!config.CLOUD_USERNAME || !config.CLOUD_ACCESS_KEY) {
       throw new Error(
-        'LAMBDATEST_USERNAME and LAMBDATEST_ACCESS_KEY are required when CLOUD_PROVIDER=lambdatest'
+        `CLOUD_USERNAME and CLOUD_ACCESS_KEY are required when CLOUD_PROVIDER=${config.CLOUD_PROVIDER}`
       );
     }
-    if (!config.LAMBDATEST_DEVICE_NAME || !config.LAMBDATEST_OS_VERSION) {
-      throw new Error(
-        'LAMBDATEST_DEVICE_NAME and LAMBDATEST_OS_VERSION are required when CLOUD_PROVIDER=lambdatest'
-      );
-    }
+    // Note: device / OS / app can come from CLOUD_DEVICE_NAME / CLOUD_OS_VERSION
+    // / CLOUD_APP, or from inline `capabilities` (top-level appium:* or a
+    // provider namespace like lt:options). We don't hard-fail here — the grid
+    // itself returns a clear W3C error if the merged caps are missing platform
+    // or device selectors, and requiring env vars would defeat the point of
+    // "everything inline in appclaw.config.ts".
   }
   return config;
 }

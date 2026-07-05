@@ -17,6 +17,7 @@ import {
   getIOSScreenSizeFromModel,
 } from '../vision/ios-device-map.js';
 import { SessionScopedMCPClient } from '../mcp/session-client.js';
+import { isCloud, buildCloudHubUrl, buildCloudCapabilities, cloudProviderLabel } from './cloud.js';
 import * as ui from '../ui/terminal.js';
 
 export interface SessionResult {
@@ -35,31 +36,45 @@ export interface SessionResult {
  *   Used for parallel runs to assign unique ports:
  *   - Android: `appium:systemPort`, `appium:mjpegServerPort`
  *   - iOS: `appium:wdaLocalPort`
+ * @param inlineCaps - Author-supplied capabilities from the SDK options object
+ *   (e.g. `new AppClaw({ capabilities: { 'lt:options': { ... } } })`).
+ *   Sits between config defaults and CAPABILITIES_FILE in precedence — a
+ *   file override still wins so environments can tweak per stage/CI.
  */
 export async function createPlatformSession(
   mcp: MCPClient,
   config: AppClawConfig,
   platform: Platform,
   _deviceType?: DeviceType,
-  extraCaps?: Record<string, unknown>
+  extraCaps?: Record<string, unknown>,
+  inlineCaps?: Record<string, unknown>
 ): Promise<SessionResult> {
   // User-supplied capabilities from CAPABILITIES_FILE (if any). Loaded once and
   // merged into whichever session path runs below.
   const fileCaps = loadCapabilitiesFile(config, platform);
+  const inlineCapsForPlatform = inlineCaps
+    ? normalizeCapabilitiesForPlatform(inlineCaps, platform, 'capabilities')
+    : {};
 
-  if (config.CLOUD_PROVIDER === 'lambdatest') {
-    return createLambdaTestSession(mcp, config, platform, fileCaps);
+  if (isCloud(config)) {
+    return createCloudSession(mcp, config, platform, { ...inlineCapsForPlatform, ...fileCaps });
   }
 
   ui.startSpinner('Creating Appium session...');
 
   const args: Record<string, unknown> = { platform };
 
-  // Capability precedence (later wins): config defaults < CAPABILITIES_FILE <
-  // extraCaps. extraCaps (parallel ports, pinned udid) must win last so concurrent
-  // workers don't collide and device pinning holds even if the file sets the same key.
+  // Capability precedence (later wins): config defaults < inline capabilities <
+  // CAPABILITIES_FILE < extraCaps. extraCaps (parallel ports, pinned udid) must win
+  // last so concurrent workers don't collide and device pinning holds even if the
+  // file sets the same key.
   if (platform === 'android') {
-    const caps = { ...buildAndroidCapabilities(config), ...fileCaps, ...extraCaps };
+    const caps = {
+      ...buildAndroidCapabilities(config),
+      ...inlineCapsForPlatform,
+      ...fileCaps,
+      ...extraCaps,
+    };
     if (Object.keys(caps).length > 0) {
       args.capabilities = JSON.stringify(caps);
     }
@@ -68,6 +83,7 @@ export async function createPlatformSession(
     // Merge config-level APP_PATH with the caps file and extraCaps (per-flow app: overrides .env).
     const iosCaps = {
       ...(config.APP_PATH ? { 'appium:app': config.APP_PATH } : {}),
+      ...inlineCapsForPlatform,
       ...fileCaps,
       ...extraCaps,
     };
@@ -227,33 +243,22 @@ function buildAndroidCapabilities(config: AppClawConfig): Record<string, unknown
   return caps;
 }
 
-/** Create a remote Appium session on LambdaTest cloud. */
-async function createLambdaTestSession(
+/**
+ * Create a remote Appium session on any cloud provider (BrowserStack, Sauce
+ * Labs, LambdaTest, or a self-hosted grid). The hub URL and capabilities are
+ * built generically in ./cloud.ts; appium-mcp forwards them to the grid.
+ */
+async function createCloudSession(
   mcp: MCPClient,
   config: AppClawConfig,
   platform: Platform,
   fileCaps: Record<string, unknown> = {}
 ): Promise<SessionResult> {
-  ui.startSpinner('Creating LambdaTest cloud session...');
+  const providerLabel = cloudProviderLabel(config);
+  ui.startSpinner(`Creating ${providerLabel} cloud session...`);
 
-  const hubUrl = `https://${config.LAMBDATEST_USERNAME}:${config.LAMBDATEST_ACCESS_KEY}@mobile-hub.lambdatest.com/wd/hub`;
-
-  const ltOptions: Record<string, unknown> = {
-    video: config.LAMBDATEST_VIDEO === 'true',
-    network: config.LAMBDATEST_NETWORK === 'true',
-    isRealMobile: true,
-  };
-  if (config.LAMBDATEST_BUILD_NAME) ltOptions.build = config.LAMBDATEST_BUILD_NAME;
-  if (config.LAMBDATEST_PROJECT_NAME) ltOptions.project = config.LAMBDATEST_PROJECT_NAME;
-  if (config.LAMBDATEST_APP) ltOptions.app = config.LAMBDATEST_APP;
-
-  const capabilities: Record<string, unknown> = {
-    'appium:deviceName': config.LAMBDATEST_DEVICE_NAME,
-    'appium:platformVersion': config.LAMBDATEST_OS_VERSION,
-    'lt:options': ltOptions,
-    // User-supplied caps win over the cloud defaults above (their explicit choice).
-    ...fileCaps,
-  };
+  const hubUrl = buildCloudHubUrl(config);
+  const capabilities = buildCloudCapabilities(config, platform, fileCaps);
 
   const args: Record<string, unknown> = {
     platform,
@@ -274,7 +279,7 @@ async function createLambdaTestSession(
 
     ui.stopSpinner();
     ui.printSetupOk(
-      `LambdaTest session created — ${config.LAMBDATEST_DEVICE_NAME} (iOS ${config.LAMBDATEST_OS_VERSION})`
+      `${providerLabel} session created — ${config.CLOUD_DEVICE_NAME} (${platform === 'ios' ? 'iOS' : 'Android'} ${config.CLOUD_OS_VERSION})`
     );
 
     const sessionIdMatch = resultText.match(/session created successfully with ID:\s*(\S+)/i);
@@ -289,8 +294,8 @@ async function createLambdaTestSession(
     ui.stopSpinner();
     const msg = err instanceof Error ? err.message : String(err);
     ui.printSetupError(
-      `Failed to create LambdaTest session: ${msg}`,
-      'Check LAMBDATEST_USERNAME, LAMBDATEST_ACCESS_KEY, LAMBDATEST_DEVICE_NAME, and LAMBDATEST_OS_VERSION'
+      `Failed to create ${providerLabel} session: ${msg}`,
+      'Check CLOUD_USERNAME, CLOUD_ACCESS_KEY, CLOUD_DEVICE_NAME, and CLOUD_OS_VERSION (or CLOUD_SERVER_URL for a custom grid)'
     );
     throw err;
   }
