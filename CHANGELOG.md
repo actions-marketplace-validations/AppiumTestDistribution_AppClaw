@@ -1,3 +1,9 @@
+## [1.9.2](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.9.1...v1.9.2) (2026-07-05)
+
+### Bug Fixes
+
+* cloud execution ([#44](https://github.com/AppiumTestDistribution/AppClaw/issues/44)) ([1e2c96c](https://github.com/AppiumTestDistribution/AppClaw/commit/1e2c96ce1ead143921e7bd6f473c54860abf5d76)), closes [#25](https://github.com/AppiumTestDistribution/AppClaw/issues/25)
+
 ## [1.9.1](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.9.0...v1.9.1) (2026-07-01)
 
 ### Bug Fixes
