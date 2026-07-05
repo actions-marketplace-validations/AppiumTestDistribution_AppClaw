@@ -1554,7 +1554,6 @@
           </button>
           <ul>
             <li><a href="#runner-overview">Overview</a></li>
-            <li><a href="#runner-quickstart">Installation &amp; First Run</a></li>
             <li><a href="#runner-tests">Writing Tests</a></li>
             <li><a href="#runner-config">Configuration</a></li>
             <li><a href="#runner-hooks">Lifecycle Hooks</a></li>
@@ -1591,6 +1590,143 @@
 
 <span class="c"># Interactive playground</span>
 <span class="k">appclaw</span> <span class="fl">--playground</span></pre>
+          </div>
+          <p>
+            For a full test project — config file, spec files, npm scripts — scaffold it with
+            <code>appclaw init</code> or set it up manually below.
+          </p>
+
+          <h3 id="runner-quickstart">Scaffold a project with <code>appclaw init</code></h3>
+          <p>
+            The fastest way to start. It asks a few questions (platform, LLM provider, agent mode —
+            use the <strong>↑/↓ arrow keys</strong> to choose), then writes a ready-to-run project.
+            It only creates files and prints next steps: it never installs packages, never touches
+            the network, and never prompts for your API key.
+          </p>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Terminal</span>
+            </div>
+            <pre><span class="c"># Scaffold into the current folder (or pass a directory name)</span>
+<span class="k">npx</span> appclaw init
+<span class="k">npx</span> appclaw init my-app
+
+<span class="c"># Skip the prompts with flags / defaults</span>
+<span class="k">npx</span> appclaw init my-app --platform ios --provider anthropic --yes</pre>
+          </div>
+
+          <p>It generates a complete Test Runner project:</p>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Generated</span>
+            </div>
+            <pre>my-app/
+  appclaw.config.ts      <span class="c"># all 5 lifecycle hooks, wired to your answers</span>
+  tests/
+    example.spec.ts      <span class="c"># a starter spec to run immediately</span>
+  .env.example           <span class="c"># full, commented reference of every setting</span>
+  .env                   <span class="c"># empty — paste your LLM_API_KEY here (gitignored)</span>
+  package.json           <span class="c"># "test" + "test:parallel" scripts, devDeps</span>
+  tsconfig.json
+  .gitignore             <span class="c"># node_modules/, .appclaw/, .env</span></pre>
+          </div>
+
+          <div class="callout callout-info">
+            <div class="callout-title">Non-destructive</div>
+            <p>
+              Re-running <code>init</code> in an existing project skips files that already exist and
+              <em>merges</em> <code>package.json</code> / <code>.gitignore</code> rather than
+              overwriting them. Pass <code>--force</code> to overwrite.
+            </p>
+          </div>
+
+          <p>Then finish setup and run:</p>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Terminal</span>
+            </div>
+            <pre><span class="k">cd</span> my-app
+<span class="k">npm</span> install
+<span class="c"># paste your key into .env → LLM_API_KEY=...</span>
+<span class="k">npm</span> test</pre>
+          </div>
+
+          <h3>Or set it up manually</h3>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Terminal</span>
+            </div>
+            <pre><span class="c"># 1. Install (project-local) — tsx loads the TypeScript specs/config</span>
+<span class="k">npm</span> install -D appclaw tsx
+
+<span class="c"># 2. Connect an emulator / device, then run all tests</span>
+<span class="k">npx</span> appclaw test
+
+<span class="c"># Run a single file, or filter by path substring</span>
+<span class="k">npx</span> appclaw test tests/login.spec.ts
+<span class="k">npx</span> appclaw test login</pre>
+          </div>
+
+          <h3>Trigger it from package.json</h3>
+          <p>
+            The normal entry point is an npm script. <code>appclaw test</code> auto-discovers
+            <code>appclaw.config.ts</code> in the working directory and runs the specs in its
+            <code>testDir</code> — so the script is just the command plus any flags.
+          </p>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">package.json</span>
+            </div>
+            <pre>{
+  <span class="s">"scripts"</span>: {
+    <span class="s">"test"</span>: <span class="s">"appclaw test"</span>,                  <span class="c">// runs everything in testDir</span>
+    <span class="s">"test:parallel"</span>: <span class="s">"appclaw test --workers 2"</span>,
+    <span class="s">"test:login"</span>: <span class="s">"appclaw test tests/login.spec.ts"</span>,
+    <span class="s">"test:grep"</span>: <span class="s">"appclaw test --grep login"</span>
+  },
+  <span class="s">"devDependencies"</span>: { <span class="s">"appclaw"</span>: <span class="s">"^1.8.0"</span>, <span class="s">"tsx"</span>: <span class="s">"^4.21.0"</span> }
+}</pre>
+          </div>
+
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Terminal</span>
+            </div>
+            <pre><span class="k">npm</span> test                  <span class="c"># → appclaw test (reads appclaw.config.ts)</span>
+<span class="k">npm</span> run test:parallel     <span class="c"># 2 devices at once</span>
+<span class="k">npm</span> run test:login        <span class="c"># a single file</span></pre>
+          </div>
+
+          <p>A minimal project layout:</p>
+          <div class="code-block">
+            <div class="code-block-header">
+              <div class="code-block-dots"><span></span><span></span><span></span></div>
+              <span class="code-block-label">Project</span>
+            </div>
+            <pre>my-app/
+  package.json          <span class="c"># "test": "appclaw test"</span>
+  appclaw.config.ts     <span class="c"># infra: nodes, concurrency, retries, llm, hooks (write once)</span>
+  tests/
+    login.spec.ts       <span class="c"># your tests — no UDIDs, no ports</span>
+    checkout.spec.ts</pre>
+          </div>
+
+          <div class="callout callout-info">
+            <div class="callout-title">TypeScript specs just work</div>
+            <p>
+              Spec and config files are TypeScript. <code>appclaw test</code> registers a TS loader
+              (<code>tsx</code>) automatically before importing them, so a plain
+              <code>"test": "appclaw test"</code> script works — just keep <code>tsx</code> in your
+              <code>devDependencies</code>. Pre-compiled <code>.js</code> specs run without it.
+            </p>
           </div>
         </section>
 
@@ -5498,144 +5634,6 @@ APP_GUIDE (WhatsApp):
               server.
             </li>
           </ul>
-        </section>
-
-        <section id="runner-quickstart" class="reveal">
-          <h2>Installation &amp; First Run</h2>
-          <p>Install AppClaw, add a config file, drop spec files in a folder, and run.</p>
-
-          <h3>Scaffold a project with <code>appclaw init</code></h3>
-          <p>
-            The fastest way to start. It asks a few questions (platform, LLM provider, agent mode —
-            use the <strong>↑/↓ arrow keys</strong> to choose), then writes a ready-to-run project.
-            It only creates files and prints next steps: it never installs packages, never touches
-            the network, and never prompts for your API key.
-          </p>
-
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Terminal</span>
-            </div>
-            <pre><span class="c"># Scaffold into the current folder (or pass a directory name)</span>
-<span class="k">npx</span> appclaw init
-<span class="k">npx</span> appclaw init my-app
-
-<span class="c"># Skip the prompts with flags / defaults</span>
-<span class="k">npx</span> appclaw init my-app --platform ios --provider anthropic --yes</pre>
-          </div>
-
-          <p>It generates a complete Test Runner project:</p>
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Generated</span>
-            </div>
-            <pre>my-app/
-  appclaw.config.ts      <span class="c"># all 5 lifecycle hooks, wired to your answers</span>
-  tests/
-    example.spec.ts      <span class="c"># a starter spec to run immediately</span>
-  .env.example           <span class="c"># full, commented reference of every setting</span>
-  .env                   <span class="c"># empty — paste your LLM_API_KEY here (gitignored)</span>
-  package.json           <span class="c"># "test" + "test:parallel" scripts, devDeps</span>
-  tsconfig.json
-  .gitignore             <span class="c"># node_modules/, .appclaw/, .env</span></pre>
-          </div>
-
-          <div class="callout callout-info">
-            <div class="callout-title">Non-destructive</div>
-            <p>
-              Re-running <code>init</code> in an existing project skips files that already exist and
-              <em>merges</em> <code>package.json</code> / <code>.gitignore</code> rather than
-              overwriting them. Pass <code>--force</code> to overwrite.
-            </p>
-          </div>
-
-          <p>Then finish setup and run:</p>
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Terminal</span>
-            </div>
-            <pre><span class="k">cd</span> my-app
-<span class="k">npm</span> install
-<span class="c"># paste your key into .env → LLM_API_KEY=...</span>
-<span class="k">npm</span> test</pre>
-          </div>
-
-          <h3>Or set it up manually</h3>
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Terminal</span>
-            </div>
-            <pre><span class="c"># 1. Install (project-local) — tsx loads the TypeScript specs/config</span>
-<span class="k">npm</span> install -D appclaw tsx
-
-<span class="c"># 2. Connect an emulator / device, then run all tests</span>
-<span class="k">npx</span> appclaw test
-
-<span class="c"># Run a single file, or filter by path substring</span>
-<span class="k">npx</span> appclaw test tests/login.spec.ts
-<span class="k">npx</span> appclaw test login</pre>
-          </div>
-
-          <h3>Trigger it from package.json</h3>
-          <p>
-            The normal entry point is an npm script. <code>appclaw test</code> auto-discovers
-            <code>appclaw.config.ts</code> in the working directory and runs the specs in its
-            <code>testDir</code> — so the script is just the command plus any flags.
-          </p>
-
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">package.json</span>
-            </div>
-            <pre>{
-  <span class="s">"scripts"</span>: {
-    <span class="s">"test"</span>: <span class="s">"appclaw test"</span>,                  <span class="c">// runs everything in testDir</span>
-    <span class="s">"test:parallel"</span>: <span class="s">"appclaw test --workers 2"</span>,
-    <span class="s">"test:login"</span>: <span class="s">"appclaw test tests/login.spec.ts"</span>,
-    <span class="s">"test:grep"</span>: <span class="s">"appclaw test --grep login"</span>
-  },
-  <span class="s">"devDependencies"</span>: { <span class="s">"appclaw"</span>: <span class="s">"^1.8.0"</span>, <span class="s">"tsx"</span>: <span class="s">"^4.21.0"</span> }
-}</pre>
-          </div>
-
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Terminal</span>
-            </div>
-            <pre><span class="k">npm</span> test                  <span class="c"># → appclaw test (reads appclaw.config.ts)</span>
-<span class="k">npm</span> run test:parallel     <span class="c"># 2 devices at once</span>
-<span class="k">npm</span> run test:login        <span class="c"># a single file</span></pre>
-          </div>
-
-          <p>A minimal project layout:</p>
-          <div class="code-block">
-            <div class="code-block-header">
-              <div class="code-block-dots"><span></span><span></span><span></span></div>
-              <span class="code-block-label">Project</span>
-            </div>
-            <pre>my-app/
-  package.json          <span class="c"># "test": "appclaw test"</span>
-  appclaw.config.ts     <span class="c"># infra: nodes, concurrency, retries, llm, hooks (write once)</span>
-  tests/
-    login.spec.ts       <span class="c"># your tests — no UDIDs, no ports</span>
-    checkout.spec.ts</pre>
-          </div>
-
-          <div class="callout callout-info">
-            <div class="callout-title">TypeScript specs just work</div>
-            <p>
-              Spec and config files are TypeScript. <code>appclaw test</code> registers a TS loader
-              (<code>tsx</code>) automatically before importing them, so a plain
-              <code>"test": "appclaw test"</code> script works — just keep <code>tsx</code> in your
-              <code>devDependencies</code>. Pre-compiled <code>.js</code> specs run without it.
-            </p>
-          </div>
         </section>
 
         <section id="runner-tests" class="reveal">
