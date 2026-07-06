@@ -1,3 +1,9 @@
+## [1.9.3](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.9.2...v1.9.3) (2026-07-06)
+
+### Bug Fixes
+
+* bigger dashboard view — analytics, anime.js, filter bar & more ([#45](https://github.com/AppiumTestDistribution/AppClaw/issues/45)) ([4c302cb](https://github.com/AppiumTestDistribution/AppClaw/commit/4c302cbd669711e80d5988062851112adb491b1c))
+
 ## [1.9.2](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.9.1...v1.9.2) (2026-07-05)
 
 ### Bug Fixes
