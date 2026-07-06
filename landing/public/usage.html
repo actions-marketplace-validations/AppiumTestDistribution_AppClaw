@@ -4055,12 +4055,16 @@ console<span class="p">.</span>log<span class="p">(</span>result<span class="p">
               <div class="code-block-dots"><span></span><span></span><span></span></div>
               <span class="code-block-label">Shell</span>
             </div>
-            <pre>npx appclaw --report</pre>
+            <pre>npx appclaw --report                              <span class="c"># serves ./.appclaw/runs/</span>
+npx appclaw --report --report-dir examples/runner <span class="c"># serve a specific location</span>
+npx appclaw --report --report-port 5000           <span class="c"># custom port</span></pre>
           </div>
 
           <p>
-            This starts a local server and opens the report in your browser. Every run is listed
-            with its steps, screenshots, pass/fail status, and timing.
+            The server reads <code>.appclaw/runs/</code> relative to the current directory. Use
+            <code>--report-dir &lt;path&gt;</code> to point it at a project elsewhere (absolute or
+            relative to cwd) without <code>cd</code>ing there. Every run is listed with its steps,
+            screenshots, pass/fail status, and timing.
           </p>
 
           <h3>Report file layout</h3>
@@ -6698,9 +6702,11 @@ tests/cart.spec.ts (1)
           <div class="callout callout-tip">
             <div class="callout-title">Current run vs. history</div>
             <p>
-              The report at the end of <code>appclaw test</code> shows just that run. The older
-              <code>appclaw --report</code> viewer is a separate, global index of <em>every</em>
-              historical run — use it to browse past results, not to read the run you just executed.
+              The report at the end of <code>appclaw test</code> shows just that run. The
+              <code>appclaw --report</code> viewer is a separate index of <em>every</em> historical
+              run — grouped by suite and spec file, with a search bar, platform filters, and a
+              14-day trend. Use it to browse past results, not to read the run you just executed.
+              Pass <code>--report-dir &lt;path&gt;</code> to serve a project from anywhere.
             </p>
           </div>
 
@@ -6716,7 +6722,10 @@ tests/cart.spec.ts (1)
               <code>SIGTERM</code> / crash) kills the node so it is never orphaned.
             </li>
           </ul>
-          <p>View the HTML reports any time with <code>appclaw --report</code>.</p>
+          <p>
+            View the HTML reports any time with <code>appclaw --report</code> (add
+            <code>--report-dir &lt;path&gt;</code> to serve reports from a location outside cwd).
+          </p>
         </section>
       </main>
     </div>
