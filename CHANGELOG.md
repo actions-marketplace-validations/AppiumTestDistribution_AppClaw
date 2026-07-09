@@ -1,3 +1,21 @@
+## [2.0.0](https://github.com/appclawhq/AppClaw/compare/v1.9.3...v2.0.0) (2026-07-09)
+
+### ⚠ BREAKING CHANGES
+
+* the `appclaw` npm package is replaced by scoped `@appclaw/*`
+packages. Install `@appclaw/cli` for the CLI and `@appclaw/runner` for the
+test runner. The `appclaw` and `appclaw-agent` package names are deprecated.
+
+Co-authored-by: Srinivasan Sekar <srinivasan.sekar1990@gmail.com>
+
+### Features
+
+* split appclaw into scoped @appclaw/* packages ([#48](https://github.com/appclawhq/AppClaw/issues/48)) ([dd6d5c4](https://github.com/appclawhq/AppClaw/commit/dd6d5c44888af28b6537cbb14774b86142328cb1))
+
+### Bug Fixes
+
+* Add testing publish step to sample.yaml ([#46](https://github.com/appclawhq/AppClaw/issues/46)) ([d260fb5](https://github.com/appclawhq/AppClaw/commit/d260fb54cbe4add4c7cab6200eb497917c0ffed9))
+
 ## [1.9.3](https://github.com/AppiumTestDistribution/AppClaw/compare/v1.9.2...v1.9.3) (2026-07-06)
 
 ### Bug Fixes
