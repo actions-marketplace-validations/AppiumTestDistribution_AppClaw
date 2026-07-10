@@ -41,7 +41,7 @@ npm install -g @appclaw/cli
 appclaw "open the settings app and turn on airplane mode"
 ```
 
-You'll need **Node.js 18+**, a connected device / emulator / simulator, and an **LLM API key** (Anthropic, OpenAI, Google, Groq, or local Ollama). Full setup → **[appclaw.in](https://appclaw.in)**.
+You'll need **Node.js 22+**, a connected device / emulator / simulator, and an **LLM API key** (Anthropic, OpenAI, Google, Groq, or local Ollama). Full setup → **[appclaw.in](https://appclaw.in)**.
 
 ## What it can do
 
