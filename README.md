@@ -48,28 +48,10 @@ AppClaw:
 npm install -g @appclaw/cli
 ```
 
-> **Package rename (scoped `@appclaw`).** The former single-package layout has
-> been split into scoped workspace packages. If you were on the old unscoped
-> names, migrate as follows:
->
-> | Old (unscoped)  | New (scoped)      | What it is                      |
-> | --------------- | ----------------- | ------------------------------- |
-> | `appclaw`       | `@appclaw/core`   | Headless engine + public SDK    |
-> | `appclaw-agent` | `@appclaw/agent`  | `appclaw-agent` device CLI      |
-> | —               | `@appclaw/cli`    | `appclaw` interactive CLI (new) |
-> | —               | `@appclaw/runner` | Vitest-style test runner (new)  |
->
-> Update your imports from `appclaw` to `@appclaw/core`, and install the CLI as
-> `@appclaw/cli` / the agent as `@appclaw/agent`.
->
-> **Maintainers only** — after the first scoped publish, run these once to point
-> the retired unscoped packages at their replacements (they require npm publish
-> rights and are **not** run by CI):
->
-> ```bash
-> npm deprecate appclaw "moved to @appclaw/core"
-> npm deprecate appclaw-agent "moved to @appclaw/agent"
-> ```
+That's all most users need. `@appclaw/cli` provides the `appclaw` command — natural-language goals, YAML flows, playground, and HTML reports — plus `appclaw init` to scaffold a test project. Install the others only for a specific need:
+
+- **Writing tests** — `appclaw init` scaffolds a project that runs on **`@appclaw/runner`** (the `appclaw-runner` test CLI); it's added for you, no manual install.
+- **Using the SDK** in your own vitest/jest/mocha — `npm install @appclaw/core`.
 
 Create a `.env` file in your working directory:
 
