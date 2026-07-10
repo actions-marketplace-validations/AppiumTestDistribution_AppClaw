@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="landing/logo.svg" alt="AppClaw logo" width="120" height="120">
-</p>
-
 <h1 align="center">AppClaw</h1>
 
 <p align="center">AI-powered mobile automation agent for Android and iOS. Tell it what to do in plain English — it figures out what to tap, type, and swipe.</p>
@@ -10,7 +6,7 @@
 <tr>
 <td valign="middle" align="center">
 
-<img src="landing/demo.gif" alt="AppClaw demo" width="280">
+<img src="landing/public/demo.gif" alt="AppClaw demo" width="280">
 
 </td>
 <td valign="middle">
