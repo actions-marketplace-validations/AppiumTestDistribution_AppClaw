@@ -1,3 +1,9 @@
+## [2.0.2](https://github.com/appclawhq/AppClaw/compare/v2.0.1...v2.0.2) (2026-08-03)
+
+### Bug Fixes
+
+* overhaul spatial locator resolution for list-row screens ([#52](https://github.com/appclawhq/AppClaw/issues/52)) ([b442987](https://github.com/appclawhq/AppClaw/commit/b4429870029cca908ca512be40818823ee830253))
+
 ## [2.0.1](https://github.com/appclawhq/AppClaw/compare/v2.0.0...v2.0.1) (2026-07-31)
 
 ### Bug Fixes
