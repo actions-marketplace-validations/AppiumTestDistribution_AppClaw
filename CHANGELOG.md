@@ -1,3 +1,9 @@
+## [2.1.0](https://github.com/appclawhq/AppClaw/compare/v2.0.3...v2.1.0) (2026-08-04)
+
+### Features
+
+* **flow:** first-class double-tap support across all surfaces ([#53](https://github.com/appclawhq/AppClaw/issues/53)) ([f9ff850](https://github.com/appclawhq/AppClaw/commit/f9ff850285497ab01ca8dcb19bfd489d851adcdd))
+
 ## [2.0.3](https://github.com/appclawhq/AppClaw/compare/v2.0.2...v2.0.3) (2026-08-04)
 
 ### Bug Fixes
