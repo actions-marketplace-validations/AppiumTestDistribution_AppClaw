@@ -1,3 +1,9 @@
+## [2.0.3](https://github.com/appclawhq/AppClaw/compare/v2.0.2...v2.0.3) (2026-08-04)
+
+### Bug Fixes
+
+* use ESM readline in iOS device prompt ([#50](https://github.com/appclawhq/AppClaw/issues/50)) ([aee7c4d](https://github.com/appclawhq/AppClaw/commit/aee7c4de93a40273b9e971d6ea2c491527a7af64))
+
 ## [2.0.2](https://github.com/appclawhq/AppClaw/compare/v2.0.1...v2.0.2) (2026-08-03)
 
 ### Bug Fixes
