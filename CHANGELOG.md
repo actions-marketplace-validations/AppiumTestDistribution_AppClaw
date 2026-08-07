@@ -1,3 +1,9 @@
+## [2.2.0](https://github.com/appclawhq/AppClaw/compare/v2.1.0...v2.2.0) (2026-08-07)
+
+### Features
+
+* Feat/anchored scroll assert ([#55](https://github.com/appclawhq/AppClaw/issues/55)) ([0607bb6](https://github.com/appclawhq/AppClaw/commit/0607bb6cc5226fbe08a0f0515fe91c36bcd5e470))
+
 ## [2.1.0](https://github.com/appclawhq/AppClaw/compare/v2.0.3...v2.1.0) (2026-08-04)
 
 ### Features
