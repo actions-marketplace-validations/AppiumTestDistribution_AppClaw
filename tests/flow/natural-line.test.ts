@@ -502,3 +502,112 @@ describe('natural-line: double tap', () => {
     expect(tryParseNaturalFlowLine('tap Photo')).toMatchObject({ kind: 'tap', label: 'Photo' });
   });
 });
+
+describe('natural-line: anchored scrollAssert', () => {
+  test('swipe the <anchor> left until <text> is visible', () => {
+    expect(
+      tryParseNaturalFlowLine('swipe the FII/DII left until Goal calculator is visible')
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'FII/DII',
+      direction: 'left',
+      text: 'Goal calculator',
+      maxScrolls: 3,
+    });
+  });
+  test('anchored form with an explicit count', () => {
+    expect(
+      tryParseNaturalFlowLine('swipe the FII/DII left 5 times until Goal calculator is visible')
+    ).toMatchObject({ kind: 'scrollAssert', target: 'FII/DII', maxScrolls: 5 });
+  });
+  test('plain scroll-until keeps working without a target', () => {
+    const r = tryParseNaturalFlowLine('scroll down until Checkout is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', direction: 'down', text: 'Checkout' });
+    expect(r && 'target' in r ? r.target : undefined).toBeUndefined();
+  });
+  test('swipe verb without a target parses too', () => {
+    const r = tryParseNaturalFlowLine('swipe left until Reviews is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', direction: 'left', text: 'Reviews' });
+    expect(r && 'target' in r ? r.target : undefined).toBeUndefined();
+  });
+  test('anchored swipe WITHOUT until stays a plain swipe step', () => {
+    expect(tryParseNaturalFlowLine('swipe the FII/DII left')).toMatchObject({
+      kind: 'swipe',
+      direction: 'left',
+      target: 'FII/DII',
+    });
+  });
+});
+
+describe('natural-line: spatially-qualified scroll areas', () => {
+  test('direction-first region form: "swipe left inside the area above View All until …"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      direction: 'left',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+      text: 'Goal calculator',
+    });
+  });
+  test('connector filler is stripped: "…the area that is located above View All…"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area that is located above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+    });
+  });
+  test('qualified labeled target: "swipe the FII/DII below Post-Market Insights left until …"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe the FII/DII below Post-Market Insights left until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      direction: 'left',
+      target: 'FII/DII',
+      targetProximity: { relation: 'below', anchor: 'Post-Market Insights' },
+      text: 'Goal calculator',
+    });
+  });
+  test('unqualified anchored form still has no targetProximity', () => {
+    const r = tryParseNaturalFlowLine('swipe the FII/DII left until Goal calculator is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', target: 'FII/DII' });
+    expect(r && 'targetProximity' in r ? r.targetProximity : undefined).toBeUndefined();
+  });
+});
+
+describe('natural-line: participle labels are not mangled by connector stripping', () => {
+  test('"Order Placed" survives as a proximity target', () => {
+    expect(tryParseNaturalFlowLine('tap Order Placed below Filters')).toMatchObject({
+      kind: 'tap',
+      label: 'Order Placed',
+      proximity: { relation: 'below', anchor: 'Filters' },
+    });
+  });
+  test('"Conveniently Located" survives too', () => {
+    expect(tryParseNaturalFlowLine('tap Conveniently Located near the map')).toMatchObject({
+      kind: 'tap',
+      label: 'Conveniently Located',
+      proximity: { relation: 'near', anchor: 'map' },
+    });
+  });
+  test('bare participle IS stripped after a generic region noun', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area located above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+    });
+  });
+});

@@ -128,6 +128,19 @@ export type FlowStep =
       text: string;
       direction: 'up' | 'down' | 'left' | 'right';
       maxScrolls: number;
+      /**
+       * Optional anchor element: the swipe gesture starts from this element's
+       * position (e.g. inside a horizontal carousel) instead of screen center.
+       * Resolved once — the anchor itself may scroll away; its coordinates stay.
+       */
+      target?: string;
+      /**
+       * Spatial qualifier picking WHICH scroll area when several exist:
+       * "the FII/DII below Post-Market Insights" or a pure region phrase
+       * ("the area above View All") whose generic noun resolves to the
+       * nearest element on that side of the qualifier's anchor.
+       */
+      targetProximity?: Proximity;
     } & Verbatim)
   | ({ kind: 'getInfo'; query: string } & Verbatim)
   | ({ kind: 'done'; message?: string } & Verbatim);

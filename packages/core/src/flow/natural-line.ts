@@ -57,14 +57,25 @@ export function splitProximity(label: string): { label: string; proximity?: Prox
   if (!m) return { label };
   // A trailing connector on the target means the relation opens a qualifier
   // clause: "YESBANK which is to the left of BSE" → target "YESBANK".
-  const target = trimPunct(m[1].trim()).replace(/\s+(?:which|that)\s+is$/i, '');
+  // Strip trailing connector filler: "which is" / "that is [located]" always;
+  // a BARE participle only after a generic region noun ("the area located
+  // above X" → "area"). A bare participle after a real label is kept —
+  // "Order Placed below Filters" must NOT become "Order".
+  const target = trimPunct(m[1].trim())
+    .replace(/\s+(?:which|that)\s+is(?:\s+(?:located|positioned|placed|situated))?$/i, '')
+    .replace(
+      /^((?:the\s+)?(?:area|section|carousel|strip|list|row|region|scroll\s*(?:area|view|section)))\s+(?:located|positioned|placed|situated)$/i,
+      '$1'
+    );
   const relWord = m[2].toLowerCase().replace(/\s+/g, ' ');
   const anchorRest = trimPunct(m[3].trim());
   const relation = PROXIMITY_RELATIONS[relWord];
   if (!relation || !target || !anchorRest) return { label };
   // Recurse on the anchor phrase (dropping an optional "which is"/"that is"
   // connector) so a qualified anchor nests instead of being matched literally.
-  const nested = splitProximity(anchorRest.replace(/\s+(?:which|that)\s+is\s+/i, ' '));
+  const nested = splitProximity(
+    anchorRest.replace(/\s+(?:which|that)\s+is\s+(?:located\s+|positioned\s+|placed\s+)?/i, ' ')
+  );
   if (nested.proximity && nested.label) {
     return {
       label: target,
@@ -251,15 +262,58 @@ export function tryParseNaturalFlowLine(line: string): FlowStep | null {
   }
 
   // scroll down until "X" is visible / scroll down 3 times to find "X"
+  // Anchored form: "swipe the FII/DII left until Goal calculator is visible" —
+  // the optional element between the verb and the direction anchors the gesture
+  // inside that element's container (a carousel/strip) instead of screen center.
   // MUST come before the simple swipe/scroll match to avoid premature matching
   const scrollAssertMatch = t.match(
-    /^scroll\s+(up|down|left|right)\s+(?:(\d+)\s+times?\s+)?(?:until|to\s+(?:find|see|check|verify))\s+["']?(.+?)["']?\s*(?:is\s+(?:visible|present|shown|displayed|seen|found|there))?$/i
+    /^(?:scroll|swipe)\s+(?:(?:the\s+)?(.+?)\s+)?(up|down|left|right)\s+(?:(\d+)\s+times?\s+)?(?:until|to\s+(?:find|see|check|verify))\s+["']?(.+?)["']?\s*(?:is\s+(?:visible|present|shown|displayed|seen|found|there))?$/i
   );
   if (scrollAssertMatch) {
-    const direction = scrollAssertMatch[1].toLowerCase() as 'up' | 'down' | 'left' | 'right';
-    const maxScrolls = scrollAssertMatch[2] ? Number(scrollAssertMatch[2]) : 3;
-    const text = stripTextPrefix(trimPunct(scrollAssertMatch[3].trim()));
-    if (text) return { kind: 'scrollAssert', text, direction, maxScrolls, verbatim };
+    const rawTarget = scrollAssertMatch[1] ? trimPunct(scrollAssertMatch[1].trim()) : undefined;
+    const direction = scrollAssertMatch[2].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const maxScrolls = scrollAssertMatch[3] ? Number(scrollAssertMatch[3]) : 3;
+    const text = stripTextPrefix(trimPunct(scrollAssertMatch[4].trim()));
+    // The anchor may itself carry a spatial qualifier picking WHICH scroll area:
+    // "swipe the FII/DII below Post-Market Insights left until … is visible".
+    const split: { label?: string; proximity?: Proximity } = rawTarget
+      ? splitProximity(rawTarget)
+      : {};
+    if (text)
+      return {
+        kind: 'scrollAssert',
+        text,
+        direction,
+        maxScrolls,
+        ...(split.label ? { target: split.label } : {}),
+        ...(split.proximity ? { targetProximity: split.proximity } : {}),
+        verbatim,
+      };
+  }
+
+  // Direction-first anchored form: "swipe left inside the area above View All
+  // until Goal calculator is visible". The region phrase may be a real element
+  // label or a spatial phrase whose noun is generic ("area", "section") — the
+  // executor then swipes from the nearest element on that side of the anchor.
+  const insideScrollAssertMatch = t.match(
+    /^(?:scroll|swipe)\s+(up|down|left|right)\s+(?:(\d+)\s+times?\s+)?(?:inside|within|in|on)\s+(?:the\s+)?(.+?)\s+(?:until|to\s+(?:find|see|check|verify))\s+["']?(.+?)["']?\s*(?:is\s+(?:visible|present|shown|displayed|seen|found|there))?$/i
+  );
+  if (insideScrollAssertMatch) {
+    const direction = insideScrollAssertMatch[1].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const maxScrolls = insideScrollAssertMatch[2] ? Number(insideScrollAssertMatch[2]) : 3;
+    const region = trimPunct(insideScrollAssertMatch[3].trim());
+    const text = stripTextPrefix(trimPunct(insideScrollAssertMatch[4].trim()));
+    const split = splitProximity(region);
+    if (text)
+      return {
+        kind: 'scrollAssert',
+        text,
+        direction,
+        maxScrolls,
+        ...(split.label ? { target: split.label } : {}),
+        ...(split.proximity ? { targetProximity: split.proximity } : {}),
+        verbatim,
+      };
   }
 
   // "drag X to Y" / "slide X to Y" / "move X to Y"
