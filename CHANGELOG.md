@@ -1,3 +1,9 @@
+## [2.3.0](https://github.com/appclawhq/AppClaw/compare/v2.2.0...v2.3.0) (2026-08-15)
+
+### Features
+
+* **flow:** add structured YAML selectors and property assertions ([#56](https://github.com/appclawhq/AppClaw/issues/56)) ([10363cd](https://github.com/appclawhq/AppClaw/commit/10363cdde36e16b19ca147ff5d23af84f067793b))
+
 ## [2.2.0](https://github.com/appclawhq/AppClaw/compare/v2.1.0...v2.2.0) (2026-08-07)
 
 ### Features
