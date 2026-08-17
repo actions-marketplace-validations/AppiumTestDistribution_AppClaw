@@ -1,3 +1,9 @@
+## [2.4.0](https://github.com/appclawhq/AppClaw/compare/v2.3.0...v2.4.0) (2026-08-17)
+
+### Features
+
+* **cli:** add appclaw doctor environment preflight ([#58](https://github.com/appclawhq/AppClaw/issues/58)) ([3805170](https://github.com/appclawhq/AppClaw/commit/3805170c2c93928e6b505920c47d936137ad7a60))
+
 ## [2.3.0](https://github.com/appclawhq/AppClaw/compare/v2.2.0...v2.3.0) (2026-08-15)
 
 ### Features
