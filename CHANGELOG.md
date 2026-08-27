@@ -1,3 +1,9 @@
+## [2.5.0](https://github.com/appclawhq/AppClaw/compare/v2.4.1...v2.5.0) (2026-08-27)
+
+### Features
+
+* introduce Terminal Studio (TUI)  ([#60](https://github.com/appclawhq/AppClaw/issues/60)) ([1ad9ce6](https://github.com/appclawhq/AppClaw/commit/1ad9ce67ee92e4314d60e5c6649fccdc8daf2ea4))
+
 ## [2.4.1](https://github.com/appclawhq/AppClaw/compare/v2.4.0...v2.4.1) (2026-08-24)
 
 ### Bug Fixes
