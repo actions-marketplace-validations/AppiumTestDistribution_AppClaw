@@ -1,3 +1,9 @@
+## [2.6.0](https://github.com/appclawhq/AppClaw/compare/v2.5.0...v2.6.0) (2026-08-31)
+
+### Features
+
+* **tui:** run goals in Terminal Studio ([#61](https://github.com/appclawhq/AppClaw/issues/61)) ([fa717e9](https://github.com/appclawhq/AppClaw/commit/fa717e95164b689686f3e93253954f3319502052))
+
 ## [2.5.0](https://github.com/appclawhq/AppClaw/compare/v2.4.1...v2.5.0) (2026-08-27)
 
 ### Features
