@@ -1,0 +1,3194 @@
+/**
+ * Execute a declarative YAML flow (structured and/or natural-language steps).
+ * Uses DOM or vision depending on AGENT_MODE:
+ * - dom (default): DOM text matching with optional vision fallback.
+ * - vision (AGENT_MODE=vision + VISION_LOCATE_PROVIDER=stark): full vision mode,
+ *   skips DOM entirely and uses screenshots + AI vision for all interactions.
+ *
+ * Steps that don't match any regex pattern are sent to the LLM for interpretation.
+ */
+
+import type { MCPClient } from '../mcp/types.js';
+import { getPageSource, findElementByVision } from '../mcp/tools.js';
+import { activateAppWithFallback, terminateApp } from '../mcp/activate-app.js';
+import { detectDeviceUdid, typeViaKeyboard, typeViaSetValue } from '../mcp/keyboard.js';
+import { detectPlatform } from '../perception/screen.js';
+import { parseAndroidPageSource } from '../perception/android-parser.js';
+import { parseIOSPageSource } from '../perception/ios-parser.js';
+import type { UIElement } from '../perception/types.js';
+import {
+  findByIdStrategies,
+  findByIdStrategiesDetailed,
+  findByVision,
+  isAIElement,
+  parseAIElementCoords,
+  tapAtCoordinates,
+} from '../agent/element-finder.js';
+import { findElement as findElementByStrategy } from '../mcp/tools.js';
+import {
+  getActiveLocatorCache,
+  lookupLocator,
+  recordHit,
+  markStale,
+  type LocatorActionKind,
+  type LocatorCacheCtx,
+  type LocatorCacheKey,
+} from '../sdk/locator-cache.js';
+import {
+  extractScreenLabels,
+  computeSemanticFingerprint,
+  extractAppIdFromDom,
+} from '../memory/fingerprint.js';
+import {
+  isVisionLocateEnabled,
+  getStarkVisionApiKey,
+  getStarkVisionBaseUrl,
+  getStarkVisionCoordinateOrder,
+  getStarkVisionModel,
+} from '../vision/locate-enabled.js';
+import { Config } from '../config.js';
+import { MODEL_PRICING } from '../constants.js';
+import { screenshot } from '../mcp/tools.js';
+import { capturePreAction } from './pre-action-capture.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import type { ActionResult } from '../llm/schemas.js';
+
+const execAsync = promisify(exec);
+import type {
+  FlowMeta,
+  FlowStep,
+  FlowPhase,
+  PhasedStep,
+  PhaseResult,
+  Proximity,
+  ProximityRelation,
+  ElementSelector,
+  ElementPropertyExpectations,
+  NumericExpectation,
+  SelectorDiagnostics,
+} from './types.js';
+import type { AppResolver } from '../agent/app-resolver.js';
+import type { RunArtifactCollector } from '../report/writer.js';
+import { lastVisionScreenshot } from './vision-execute.js';
+import { resolveAppId } from '../agent/preprocessor.js';
+import { pngDimensionsFromBase64 } from '../vision/png-dimensions.js';
+import {
+  getCachedScreenSize,
+  getScreenSizeForStark,
+  getDevicePlatform,
+} from '../vision/window-size.js';
+import type { ScrollDistance } from '../sdk/types.js';
+import chalk from 'chalk';
+import * as ui from '../ui/terminal.js';
+import { resetVisionTokens, getVisionTokens } from '../vision/vision-token-tracker.js';
+import {
+  describeElementSelector,
+  evaluateStructuredAssertion,
+  resolveElementSelector,
+  snapshotElement,
+} from './selector.js';
+import { redactSensitiveData, redactSensitiveValues } from './variable-resolver.js';
+
+/** Extract [x, y] coordinates from an action result message like 'Tapped "X" via vision at [320, 540]' */
+function extractCoordinates(message?: string): { x: number; y: number } | undefined {
+  if (!message) return undefined;
+  const m = message.match(/\[(\d+),\s*(\d+)\]/);
+  if (m) return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+  return undefined;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export interface RunYamlFlowOptions {
+  stepDelayMs?: number;
+  /** Required for natural-language `open … app` steps */
+  appResolver?: AppResolver;
+  /**
+   * When tapping by label, re-read the hierarchy this many times until a match appears
+   * (covers navigation / animation). Default 20 × 300ms ≈ 6s max wait before vision / failure.
+   */
+  tapTargetMaxAttempts?: number;
+  tapTargetPollIntervalMs?: number;
+  /** Optional callback for each flow step execution (used by --json mode / IDE extensions) */
+  onFlowStep?: (
+    step: number,
+    total: number,
+    kind: string,
+    target: string | undefined,
+    status: 'running' | 'passed' | 'failed',
+    error?: string,
+    message?: string
+  ) => void;
+  /** Optional artifact collector for report generation. When set, screenshots are captured after each step. */
+  artifactCollector?: RunArtifactCollector;
+  /** Known device UDID from setup — avoids ADB re-detection (which fails when multiple devices are connected) */
+  deviceUdid?: string;
+}
+
+const DEFAULT_TAP_MAX_ATTEMPTS = 20;
+const DEFAULT_TAP_POLL_MS = 300;
+
+export interface FlowTapPollOptions {
+  maxAttempts: number;
+  intervalMs: number;
+}
+
+/** Per-step scroll/swipe overrides threaded down from the SDK's run() options. */
+export interface ScrollControl {
+  /** Override the repeat count (swipe) / max scroll attempts (scroll-until). */
+  times?: number;
+  /** Override how far each scroll/swipe travels. */
+  distance?: ScrollDistance;
+}
+
+/** Fraction of the screen each scroll/swipe spans. `medium` matches appium-mcp's default (~0.6). */
+const SCROLL_DISTANCE_FRACTION: Record<ScrollDistance, number> = {
+  short: 0.3,
+  medium: 0.6,
+  full: 0.9,
+};
+
+/**
+ * Compute custom start/end coordinates for a distance-controlled scroll/swipe.
+ *
+ * appium-mcp's plain `scroll`/`swipe` actions take a `direction` and use a fixed
+ * ~60% span — `scrollDistance` is honoured only by `scroll_to_element`. So to
+ * vary the distance we pass explicit coordinates instead of a direction.
+ *
+ * Because appium-mcp internally FLIPS the vertical direction on Android (its
+ * scrollbar convention) and that flip only runs in the direction-based path, we
+ * replicate it here so AppClaw's "swipe down = reveal content below" convention
+ * is preserved when we drive by coordinates.
+ *
+ * Returns null when the screen size isn't cached yet — callers fall back to the
+ * direction-based gesture.
+ */
+function scrollCoordsForDistance(
+  mcp: MCPClient,
+  direction: 'up' | 'down' | 'left' | 'right',
+  distance: ScrollDistance
+): { x: number; y: number; endX: number; endY: number } | null {
+  const size = getCachedScreenSize(mcp);
+  if (!size) return null;
+  const { width, height } = size;
+  const fraction = SCROLL_DISTANCE_FRACTION[distance];
+  const centerX = Math.floor(width / 2);
+  const centerY = Math.floor(height / 2);
+  const isVertical = direction === 'up' || direction === 'down';
+
+  let dir = direction;
+  if (isVertical && getDevicePlatform(mcp) === 'android') {
+    dir = direction === 'up' ? 'down' : 'up';
+  }
+
+  if (isVertical) {
+    const half = Math.floor((height * fraction) / 2);
+    return dir === 'up'
+      ? { x: centerX, y: centerY + half, endX: centerX, endY: centerY - half }
+      : { x: centerX, y: centerY - half, endX: centerX, endY: centerY + half };
+  }
+  const half = Math.floor((width * fraction) / 2);
+  return dir === 'left'
+    ? { x: centerX + half, y: centerY, endX: centerX - half, endY: centerY }
+    : { x: centerX - half, y: centerY, endX: centerX + half, endY: centerY };
+}
+
+/**
+ * Resolve a target label to its on-screen center `[x, y]` in device coordinates,
+ * or null when it can't be located. Vision-first when available (handles
+ * icon-only / unlabeled elements), then falls back to DOM page-source matching.
+ */
+async function resolveTargetCenter(
+  mcp: MCPClient,
+  target: string
+): Promise<[number, number] | null> {
+  if (isVisionMode() || isVisionLocateEnabled()) {
+    try {
+      const visionUuid = await findElementByVision(mcp, target);
+      const coords = parseAIElementCoords(visionUuid);
+      if (coords) return [coords.x, coords.y];
+    } catch {
+      // Fall through to DOM.
+    }
+  }
+  try {
+    const pageSource = await getPageSource(mcp);
+    const platform = detectPlatform(pageSource);
+    const elements =
+      platform === 'android' ? parseAndroidPageSource(pageSource) : parseIOSPageSource(pageSource);
+    const wantsClickable = trailingRoleWord(target) != null;
+    const pick = elements
+      .map((el) => ({ el, s: scoreTapMatch(el, target) }))
+      .filter((x) => x.s >= 0)
+      .map((x) => ({ ...x, eff: x.s + (wantsClickable && !x.el.clickable ? 0.5 : 0) }))
+      .sort((a, b) => {
+        if (a.eff !== b.eff) return a.eff - b.eff;
+        if (a.el.clickable !== b.el.clickable) return a.el.clickable ? -1 : 1;
+        return 0;
+      })[0]?.el;
+    if (pick) return pick.center;
+  } catch {
+    // Fall through.
+  }
+  return null;
+}
+
+/**
+ * Start/end coordinates for an element-anchored swipe: begin at `center` and
+ * move `distance` of the screen toward `direction`. Unlike `scrollCoordsForDistance`,
+ * this is a LITERAL drag (no Android scrollbar flip) — "swipe the slider right"
+ * should move the thumb right, not scroll content.
+ */
+function anchoredSwipeCoords(
+  mcp: MCPClient,
+  center: [number, number],
+  direction: 'up' | 'down' | 'left' | 'right',
+  distance?: ScrollDistance
+): { x: number; y: number; endX: number; endY: number } {
+  const [x, y] = center;
+  const size = getCachedScreenSize(mcp);
+  const fraction = SCROLL_DISTANCE_FRACTION[distance ?? 'medium'];
+  const spanX = Math.floor((size?.width ?? 1080) * fraction);
+  const spanY = Math.floor((size?.height ?? 1920) * fraction);
+  // Only clamp to bounds when the real screen size is known — clamping to the
+  // fallback dims could push the endpoint to the wrong side of the start coord.
+  const clampX = (v: number) => (size ? Math.max(1, Math.min(size.width - 1, v)) : Math.max(1, v));
+  const clampY = (v: number) => (size ? Math.max(1, Math.min(size.height - 1, v)) : Math.max(1, v));
+  switch (direction) {
+    case 'right':
+      return { x, y, endX: clampX(x + spanX), endY: y };
+    case 'left':
+      return { x, y, endX: clampX(x - spanX), endY: y };
+    case 'down':
+      return { x, y, endX: x, endY: clampY(y + spanY) };
+    case 'up':
+      return { x, y, endX: x, endY: clampY(y - spanY) };
+  }
+}
+
+export interface RunYamlFlowResult {
+  success: boolean;
+  stepsExecuted: number;
+  stepsTotal: number;
+  failedAt?: number;
+  reason?: string;
+  /** Per-phase breakdown (populated when using setup/steps/assertions). */
+  phaseResults?: PhaseResult[];
+  /** Which phase failed (if any). */
+  failedPhase?: FlowPhase;
+}
+
+function rawStepLabel(step: FlowStep): string {
+  if (step.verbatim) return step.verbatim;
+  switch (step.kind) {
+    case 'launchApp':
+      return 'launchApp';
+    case 'openApp':
+      return `open "${step.query}"`;
+    case 'closeApp':
+      return step.query ? `close "${step.query}"` : 'close app';
+    case 'wait':
+      return `wait ${step.seconds}s`;
+    case 'waitUntil':
+      if (step.condition === 'screenLoaded')
+        return `wait until screen is loaded (${step.timeoutSeconds}s timeout)`;
+      if (step.selector)
+        return `wait until selector(${describeElementSelector(step.selector)}) is ${step.condition === 'gone' ? 'gone' : 'visible'} (${step.timeoutSeconds}s timeout)`;
+      if (step.condition === 'gone')
+        return `wait until "${step.text}" is gone (${step.timeoutSeconds}s timeout)`;
+      return `wait until "${step.text}" is visible (${step.timeoutSeconds}s timeout)`;
+    case 'tap':
+      return `tap "${step.label}"`;
+    case 'doubleTap':
+      return `double-tap "${step.label}"`;
+    case 'longPress':
+      return `long-press "${step.label}"${step.duration != null ? ` (${step.duration}ms)` : ''}`;
+    case 'type':
+      return `type "${step.sensitive ? '***' : step.text.length > 40 ? `${step.text.slice(0, 37)}…` : step.text}"${step.selector ? ` in selector(${describeElementSelector(step.selector)})` : ''}`;
+    case 'enter':
+      return 'enter';
+    case 'back':
+      return 'goBack';
+    case 'home':
+      return 'goHome';
+    case 'swipe':
+      return `swipe ${step.direction}${step.selector ? ` from selector(${describeElementSelector(step.selector)})` : ''}`;
+    case 'zoom':
+      return `zoom ${step.scale >= 1 ? 'in' : 'out'} (${step.scale}x)${step.selector ? ` on selector(${describeElementSelector(step.selector)})` : step.target ? ` on "${step.target}"` : ''}`;
+    case 'drag':
+      return `drag "${step.from}" to "${step.to}"`;
+    case 'assert':
+      return step.selector
+        ? `assert selector(${describeElementSelector(step.selector)})`
+        : `assert "${step.text ?? ''}"`;
+    case 'scrollAssert':
+      return `scroll ${step.direction} until ${
+        step.selector
+          ? `selector(${describeElementSelector(step.selector)})`
+          : `"${step.text ?? ''}"`
+      }${step.target ? ` (on "${step.target}")` : ''}`;
+    case 'getInfo':
+      return `getInfo "${step.query.length > 50 ? `${step.query.slice(0, 47)}…` : step.query}"`;
+    case 'done':
+      return step.message ? `done (${step.message})` : 'done';
+  }
+}
+
+function stepLabel(step: FlowStep): string {
+  return redactSensitiveValues(rawStepLabel(step), step.sensitiveValues);
+}
+
+/**
+ * Trailing words that name an element's *role* rather than its visible label.
+ * "login button" means "the Login control" — the word "button" is a type hint,
+ * so matching it against element text would wrongly favour a static label like
+ * a header title "Login" over the real (differently-cased) "LOG IN" button.
+ */
+const ROLE_WORDS = new Set([
+  'button',
+  'btn',
+  'field',
+  'input',
+  'textbox',
+  'textfield',
+  'icon',
+  'image',
+  'link',
+  'tab',
+  'option',
+  'item',
+  'menu',
+  'toggle',
+  'switch',
+  'checkbox',
+  'radio',
+  'label',
+  'cell',
+  'row',
+  'badge',
+  'chip',
+  'tag',
+]);
+
+/** Collapse case + separators so "LOG IN", "log-in" and "login" all compare equal. */
+function squashLabel(s: string): string {
+  return s.toLowerCase().replace(/[\s\-_]+/g, '');
+}
+
+/** The trailing role word of a needle ("login button" → "button"), or null. */
+export function trailingRoleWord(needle: string): string | null {
+  const parts = needle.trim().split(/\s+/);
+  const last = parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';
+  return last && ROLE_WORDS.has(last) ? last : null;
+}
+
+/** Drop a trailing role word: "login button" → "login". Unchanged when none. */
+function stripRoleWord(needle: string): string {
+  return trailingRoleWord(needle) ? needle.trim().replace(/\s+\S+$/, '') : needle;
+}
+
+export function scoreTapMatch(el: UIElement, needle: string): number {
+  if (el.enabled === false) return -1;
+
+  // An editable's `text` is its current VALUE (whatever was typed into it),
+  // not a label — "tap YESBANK" must never target the search box just because
+  // "YesBank" was typed there. Editables stay matchable via their real labels:
+  // hint, accessibility id (content-desc), and resource id.
+  const fields = [el.editable ? '' : el.text, el.hint ?? '', el.accessibilityId, el.id]
+    .map(squashLabel)
+    .filter((f) => f.length > 0);
+  if (fields.length === 0) return -1;
+
+  // Match against the raw needle AND a role-word-stripped variant
+  // ("login button" → also "login"), separator-insensitively, keeping the best
+  // (lowest) score. Keeping the raw needle means a literal "Radio button" label
+  // still matches exactly when the user types "radio button".
+  const needles = [needle, stripRoleWord(needle)].map(squashLabel).filter((n) => n.length > 0);
+
+  let best = -1;
+  for (const n of needles) {
+    for (const f of fields) {
+      let s = -1;
+      if (f === n)
+        s = 0; // exact
+      else if (n.length >= 2 && f.includes(n))
+        s = 1; // needle inside field
+      // Field inside needle counts only when the field covers at least half of
+      // it. Without the floor, a garbled instruction that failed to parse as a
+      // spatial qualifier ("YESBANK to the righ to ₹2.02") silently degrades
+      // into a confident tap on ANY element whose text appears in the phrase.
+      else if (f.length >= 2 && f.length * 2 >= n.length && n.includes(f)) s = 2;
+      if (s >= 0 && (best === -1 || s < best)) best = s;
+    }
+  }
+  return best;
+}
+
+// ─── Spatial / proximity ranking ─────────────────────────────────────
+//
+// Modeled on Taiko's proximity selectors
+// (https://github.com/getgauge/taiko/wiki/Taiko's-Proximity-Selector):
+// `above`, `below`, `toLeftOf`, `toRightOf`, `near`, `within`. The edge
+// comparisons follow Taiko's geometry exactly; ranking among multiple matches
+// uses Taiko's bounding-box distance (sum of the four edge differences).
+//
+// The one deliberate divergence: Taiko's `near` offset is a fixed CSS-pixel
+// constant, which is meaningless across mobile device-pixel densities (a phone
+// page source runs to ~1080–1440 × ~2400–3200). So `near` here uses an offset
+// that is RELATIVE to the anchor's own size and EXPANDS until something matches
+// — Taiko's behavior, made density-correct.
+
+interface Rect {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+}
+
+/** Axis-aligned bounding box from an element's center + size. */
+function rectOf(el: UIElement): Rect {
+  const [cx, cy] = el.center;
+  const [w, h] = el.size;
+  return { left: cx - w / 2, right: cx + w / 2, top: cy - h / 2, bottom: cy + h / 2 };
+}
+
+/** Taiko's ranking metric: sum of |Δ| across all four edges. Lower = closer. */
+function bboxDistance(a: Rect, b: Rect): number {
+  return (
+    Math.abs(a.left - b.left) +
+    Math.abs(a.right - b.right) +
+    Math.abs(a.top - b.top) +
+    Math.abs(a.bottom - b.bottom)
+  );
+}
+
+/** Whether `cand` satisfies `relation` w.r.t. `anchor` (Taiko geometry). `tol` only used by `near`. */
+function satisfiesRelation(
+  cand: Rect,
+  anchor: Rect,
+  relation: ProximityRelation,
+  tol = 0
+): boolean {
+  switch (relation) {
+    case 'above':
+      return cand.bottom < anchor.top;
+    case 'below':
+      return cand.top > anchor.bottom;
+    case 'toLeftOf':
+      return cand.right <= anchor.left;
+    case 'toRightOf':
+      return cand.left >= anchor.right;
+    case 'within':
+      return (
+        cand.left >= anchor.left &&
+        cand.right <= anchor.right &&
+        cand.top >= anchor.top &&
+        cand.bottom <= anchor.bottom
+      );
+    case 'near': {
+      // `cand` intersects `anchor` expanded by `tol` on every side.
+      const exp: Rect = {
+        left: anchor.left - tol,
+        right: anchor.right + tol,
+        top: anchor.top - tol,
+        bottom: anchor.bottom + tol,
+      };
+      return (
+        cand.left <= exp.right &&
+        cand.right >= exp.left &&
+        cand.top <= exp.bottom &&
+        cand.bottom >= exp.top
+      );
+    }
+  }
+}
+
+/**
+ * Rank `candidates` by how well they satisfy a spatial `relation` to `anchor`,
+ * best first. Candidates that don't satisfy the relation are dropped. The anchor
+ * element itself is never returned. Returns [] when nothing qualifies.
+ *
+ * `near` starts with an offset of one anchor-dimension and grows (×1.6, capped)
+ * until at least one candidate is in range — so it adapts to element scale and
+ * device density instead of a fixed pixel constant.
+ */
+export function rankBySpatial(
+  candidates: UIElement[],
+  anchor: UIElement,
+  relation: ProximityRelation
+): UIElement[] {
+  const anchorRect = rectOf(anchor);
+  const pool = candidates.filter((c) => c !== anchor && c.enabled !== false);
+
+  const sortByDistance = (els: UIElement[]): UIElement[] =>
+    els
+      .map((el) => ({ el, d: bboxDistance(rectOf(el), anchorRect) }))
+      .sort((a, b) => a.d - b.d)
+      .map((x) => x.el);
+
+  if (relation === 'near') {
+    const base = Math.max(
+      anchorRect.right - anchorRect.left,
+      anchorRect.bottom - anchorRect.top,
+      1
+    );
+    let tol = base;
+    for (let i = 0; i < 6; i++) {
+      const hits = pool.filter((c) => satisfiesRelation(rectOf(c), anchorRect, 'near', tol));
+      if (hits.length > 0) return sortByDistance(hits);
+      tol *= 1.6;
+    }
+    return [];
+  }
+
+  const hits = pool.filter((c) => satisfiesRelation(rectOf(c), anchorRect, relation));
+  return sortByDistance(hits);
+}
+
+/** Human-readable phrase for a relation, for error messages. */
+function relationPhrase(r: ProximityRelation): string {
+  switch (r) {
+    case 'toLeftOf':
+      return 'to the left of';
+    case 'toRightOf':
+      return 'to the right of';
+    default:
+      return r; // above | below | near | within
+  }
+}
+
+/** Nearest same-row element to the right of `cur` (vertical overlap, left edge past
+ *  `cur`'s right edge minus half-height slack for badge padding), or null. */
+function nearestRightNeighbor(pool: UIElement[], cur: UIElement): UIElement | null {
+  const c = rectOf(cur);
+  const slack = (c.bottom - c.top) / 2;
+  let best: UIElement | null = null;
+  let bestLeft = Infinity;
+  for (const e of pool) {
+    if (e === cur) continue;
+    const r = rectOf(e);
+    if (r.top >= c.bottom || r.bottom <= c.top) continue; // no vertical overlap
+    if (r.left < c.right - slack) continue; // not to the right
+    if (r.left < bestLeft) {
+      bestLeft = r.left;
+      best = e;
+    }
+  }
+  return best;
+}
+
+/** Union rect of a group as a synthetic (non-DOM) element, for anchoring / coordinate taps. */
+function mergeElements(group: UIElement[]): UIElement {
+  const rects = group.map(rectOf);
+  const left = Math.min(...rects.map((r) => r.left));
+  const right = Math.max(...rects.map((r) => r.right));
+  const top = Math.min(...rects.map((r) => r.top));
+  const bottom = Math.max(...rects.map((r) => r.bottom));
+  return {
+    ...group[0],
+    id: '',
+    accessibilityId: '',
+    text: group.map((g) => g.text).join(' '),
+    bounds: '',
+    center: [Math.round((left + right) / 2), Math.round((top + bottom) / 2)],
+    size: [right - left, bottom - top],
+    clickable: group.some((g) => g.clickable),
+  };
+}
+
+/**
+ * Resolve a label that SPANS multiple adjacent elements — badge clusters like
+ * "NSE FO" + "OPT" for the label "NSEFO OPT". Starting from an element whose
+ * squashed text is a proper prefix of the squashed label, extend rightward
+ * through the nearest same-row neighbour whose text continues the phrase until
+ * it is fully consumed. Returns synthetic elements covering each matching
+ * group's union rect (no DOM identity — callers must anchor on them or tap
+ * their coordinates), in document order; empty when no adjacent run spells
+ * out the label.
+ */
+function resolveCompoundLabelElements(elements: UIElement[], label: string): UIElement[] {
+  const want = squashLabel(label);
+  if (!want) return [];
+  const labeled = elements.filter(
+    (e) => e.enabled !== false && !e.editable && squashLabel(e.text).length > 0
+  );
+  const clusters: UIElement[] = [];
+  for (const start of labeled) {
+    const first = squashLabel(start.text);
+    if (first.length >= want.length || !want.startsWith(first)) continue;
+    let remaining = want.slice(first.length);
+    const group = [start];
+    let cur = start;
+    while (remaining.length > 0) {
+      const next = nearestRightNeighbor(labeled, cur);
+      if (!next) break;
+      const sq = squashLabel(next.text);
+      if (!sq || !remaining.startsWith(sq)) break;
+      remaining = remaining.slice(sq.length);
+      group.push(next);
+      cur = next;
+    }
+    if (remaining.length === 0 && group.length > 1) clusters.push(mergeElements(group));
+  }
+  return clusters;
+}
+
+function resolveCompoundLabelElement(elements: UIElement[], label: string): UIElement | null {
+  return resolveCompoundLabelElements(elements, label)[0] ?? null;
+}
+
+/** Best textual match for an anchor label among parsed elements, or null. */
+function resolveAnchorElement(elements: UIElement[], anchorLabel: string): UIElement | null {
+  const scored = elements
+    .map((el) => ({ el, s: scoreTapMatch(el, anchorLabel) }))
+    .filter((x) => x.s >= 0)
+    .sort((a, b) => a.s - b.s);
+  const best = scored[0];
+  // Exact match, or the whole anchor contained in one field, is trustworthy.
+  if (best && best.s <= 1) return best.el;
+  // Otherwise the anchor is only PARTIALLY present in any single element —
+  // trust it only when ADJACENT elements spell out the full phrase (badge
+  // clusters like "NSE FO" + "OPT" for "NSEFO OPT"). A fragment match is a
+  // guess: anchoring "NSEFO SAI" on the first "NSE FO" badge would tap a
+  // confidently wrong row, so fail and report the anchor as not found.
+  return resolveCompoundLabelElement(elements, anchorLabel);
+}
+
+/** ALL plausible anchor candidates for a label: every match in the best
+ *  single-element tier, or compound clusters. Same strictness as
+ *  resolveAnchorElement — fragment matches are guesses, not candidates. */
+function anchorCandidateElements(elements: UIElement[], anchorLabel: string): UIElement[] {
+  const scored = elements
+    .map((el) => ({ el, s: scoreTapMatch(el, anchorLabel) }))
+    .filter((x) => x.s >= 0)
+    .sort((a, b) => a.s - b.s);
+  if (scored.length > 0 && scored[0].s <= 1) {
+    const bestTier = scored[0].s;
+    return scored.filter((x) => x.s === bestTier).map((x) => x.el);
+  }
+  return resolveCompoundLabelElements(elements, anchorLabel);
+}
+
+/**
+ * Resolve a proximity's anchor element, honoring a chained qualifier:
+ * "NSEFO which is near ₹0.04" resolves the ₹0.04 element first, then picks
+ * the "NSEFO" candidate that best satisfies `near` relative to it.
+ */
+function resolveAnchor(elements: UIElement[], proximity: Proximity): UIElement | null {
+  const inner = proximity.anchorProximity;
+  if (!inner) return resolveAnchorElement(elements, proximity.anchor);
+  const innerAnchor = resolveAnchor(elements, inner);
+  if (!innerAnchor) return null;
+  const ranked = rankBySpatial(
+    anchorCandidateElements(elements, proximity.anchor),
+    innerAnchor,
+    inner.relation
+  );
+  return ranked[0] ?? null;
+}
+
+/**
+ * A failed tap whose label still contains direction-ish words most likely holds
+ * a MISSPELLED spatial qualifier ("YESBANK to the righ to ₹2.02") that the
+ * parser couldn't recognize, so the whole phrase became the label. Suggest the
+ * correct phrasing instead of leaving a bare "no match".
+ */
+function spatialTypoHint(label: string): string {
+  const directionish =
+    /\b(?:left|lef|right|righ|rigth|above|abov|below|belo|under|beneath|near|beside|inside|within|next)\b/i;
+  return directionish.test(label)
+    ? ' — if you meant a spatial qualifier, phrase it like "<target> to the right of <anchor>"'
+    : '';
+}
+
+/** Human-readable anchor phrase for messages: `"NSEFO" near "₹0.04"` or `"BSE"`. */
+function describeAnchor(p: Proximity): string {
+  return p.anchorProximity
+    ? `"${p.anchor}" ${relationPhrase(p.anchorProximity.relation)} ${describeAnchor(p.anchorProximity)}`
+    : `"${p.anchor}"`;
+}
+
+/**
+ * Resolve which element a `tap` should act on.
+ *
+ * Scores every element textually (with the clickable nudge the tap path uses),
+ * then — when a `proximity` qualifier is present — restricts to clickable
+ * candidates (so stray text that merely contains the word can't win on distance)
+ * and ranks them spatially against the resolved anchor. Returns `{ el: null,
+ * reason }` when nothing qualifies so the caller can retry / hard-fail.
+ */
+export function resolveTapTarget(
+  elements: UIElement[],
+  label: string,
+  proximity?: Proximity
+): { el: UIElement | null; reason?: string; coordinateOnly?: boolean } {
+  const wantsClickable = trailingRoleWord(label) != null;
+  const scored = elements
+    .map((el) => ({ el, s: scoreTapMatch(el, label) }))
+    .filter((x) => x.s >= 0)
+    .map((x) => ({ ...x, eff: x.s + (wantsClickable && !x.el.clickable ? 0.5 : 0) }))
+    .sort((a, b) => {
+      if (a.eff !== b.eff) return a.eff - b.eff;
+      if (a.el.clickable !== b.el.clickable) return a.el.clickable ? -1 : 1;
+      return 0;
+    });
+
+  // No single element carries the label, or only loosely (field ⊂ label): the
+  // label may SPAN adjacent elements (badge clusters like "NSE FO" + "OPT").
+  // The merged pick has no DOM identity, so it must be tapped by coordinates.
+  if (!proximity && (scored.length === 0 || scored[0].s >= 2)) {
+    const compound = resolveCompoundLabelElement(elements, label);
+    if (compound) return { el: compound, coordinateOnly: true };
+  }
+
+  if (scored.length === 0) return { el: null, reason: `no element matches "${label}"` };
+  if (!proximity) return { el: scored[0].el };
+
+  const anchorEl = resolveAnchor(elements, proximity);
+  if (!anchorEl) return { el: null, reason: `anchor ${describeAnchor(proximity)} not found` };
+
+  // A spatial pick ranks purely by distance, so clickable candidates are tried
+  // first — stray text that merely contains the word (e.g. a help paragraph
+  // mentioning "login button") can sit closer to the anchor than the real
+  // control. But lists often expose the visible text on a NON-clickable
+  // TextView (the clickable row container carries no text of its own), so when
+  // no clickable candidate satisfies the relation, retry with the full textual
+  // pool — tapping the text element dispatches to its clickable ancestor.
+  const candidateEls = scored.map((x) => x.el);
+  const clickable = candidateEls.filter((e) => e.clickable);
+  const clickableRanked = rankBySpatial(clickable, anchorEl, proximity.relation);
+  const ranked =
+    clickableRanked.length > 0
+      ? clickableRanked
+      : rankBySpatial(candidateEls, anchorEl, proximity.relation);
+  if (ranked.length === 0) {
+    return {
+      el: null,
+      reason: `${candidateEls.length} element(s) match "${label}" but none is ${relationPhrase(proximity.relation)} the anchor`,
+    };
+  }
+  return { el: ranked[0] };
+}
+
+/**
+ * Resolve which editable field a `type` should write into.
+ *
+ * Tiers:
+ *   1. Direct  — `target` matches an editable element's own text/hint/id/aid.
+ *   2. Label   — `target` matches a non-editable label; the nearest editable wins
+ *                (covers the "Username" label sitting above its input).
+ *   3. Spatial — a `proximity` qualifier narrows the pool by relation to an anchor.
+ *
+ * Returns `{ el: null, reason }` when nothing qualifies — the caller hard-fails
+ * rather than silently typing into the first field on screen.
+ */
+export function resolveEditableForTarget(
+  elements: UIElement[],
+  target?: string,
+  proximity?: Proximity
+): { el: UIElement | null; reason?: string } {
+  const editables = elements.filter((e) => e.editable && e.enabled !== false);
+  if (editables.length === 0) return { el: null, reason: 'no editable field on screen' };
+
+  let candidates: UIElement[] = editables;
+  if (target) {
+    // 1. Direct match among editable fields.
+    candidates = editables
+      .map((el) => ({ el, s: scoreTapMatch(el, target) }))
+      .filter((x) => x.s >= 0)
+      .sort((a, b) => a.s - b.s)
+      .map((x) => x.el);
+    // 2. Otherwise treat target as a nearby label and find the closest input.
+    if (candidates.length === 0) {
+      const labelEl = resolveAnchorElement(elements, target);
+      if (labelEl) candidates = rankBySpatial(editables, labelEl, 'near');
+    }
+  }
+
+  // 3. Spatial qualifier narrows by relation to a named anchor.
+  if (proximity) {
+    const anchorEl = resolveAnchor(elements, proximity);
+    if (!anchorEl)
+      return { el: null, reason: `anchor ${describeAnchor(proximity)} not found on screen` };
+    const pool = candidates.length > 0 ? candidates : editables;
+    const ranked = rankBySpatial(pool, anchorEl, proximity.relation);
+    if (ranked.length === 0) {
+      return {
+        el: null,
+        reason: `no input field ${relationPhrase(proximity.relation)} "${proximity.anchor}"`,
+      };
+    }
+    return { el: ranked[0] };
+  }
+
+  if (candidates.length === 0) {
+    return { el: null, reason: `"${target}" did not match any input field` };
+  }
+  return { el: candidates[0] };
+}
+
+/**
+ * Press Enter/Return key — tries multiple strategies:
+ * 1. appium_mobile_press_key with ENTER (works cross-platform)
+ * 2. appium_execute_script with mobile: shell (Android keyevent 66)
+ * 3. ADB keyevent fallback (Android only)
+ */
+async function pressEnterKey(mcp: MCPClient): Promise<ActionResult> {
+  // Strategy 1: cross-platform via appium_mobile_press_key
+  try {
+    await mcp.callTool('appium_mobile_press_key', { key: 'ENTER' });
+    return { success: true, message: 'Pressed Enter' };
+  } catch {
+    /* try next strategy */
+  }
+
+  // Strategy 2: appium_mobile_press_key ENTER fallback
+  try {
+    await mcp.callTool('appium_mobile_press_key', { key: 'ENTER' });
+    return { success: true, message: 'Pressed Enter' };
+  } catch {
+    /* try next strategy */
+  }
+
+  // Strategy 3: ADB fallback (Android only)
+  try {
+    const udid = await detectDeviceUdid();
+    const androidHome =
+      process.env.ANDROID_HOME ||
+      process.env.ANDROID_SDK_ROOT ||
+      `${process.env.HOME}/Library/Android/sdk`;
+    const adbPath = `${androidHome}/platform-tools/adb`;
+    const deviceFlag = udid ? `-s ${udid}` : '';
+    await execAsync(`${adbPath} ${deviceFlag} shell input keyevent 66`, { timeout: 5000 });
+    return { success: true, message: 'Pressed Enter' };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, message: `Failed to press Enter: ${msg}` };
+  }
+}
+
+/** Whether the flow should operate in full-vision mode (skip DOM). */
+function isVisionMode(): boolean {
+  return Config.AGENT_MODE === 'vision' && isVisionLocateEnabled();
+}
+
+// ─── SDK locator cache helpers ──────────────────────────────────────────────
+//
+// These run only when an SDK caller opted into `locatorCache`. For YAML-flow,
+// step-recorder, and goal-agent paths the active context is always undefined and
+// every helper below short-circuits — behavior unchanged.
+
+/** Build a cache key from the current page source + the action being performed. */
+function buildCacheKey(
+  ctx: LocatorCacheCtx,
+  pageSource: string,
+  actionKind: LocatorActionKind,
+  label: string
+): { key: LocatorCacheKey; screenLabels: string[]; appId: string } | null {
+  const platform = detectPlatform(pageSource);
+  const appId = extractAppIdFromDom(pageSource) ?? ctx.currentAppId;
+  // No app ID = no useful cache scoping (would collide across apps). Skip
+  // rather than persisting a polluting entry under appId="unknown".
+  if (!appId) return null;
+  const screenLabels = extractScreenLabels(pageSource);
+  const screenFingerprint = computeSemanticFingerprint(screenLabels);
+  return {
+    screenLabels,
+    appId,
+    key: {
+      namespace: ctx.namespace,
+      platform,
+      appId,
+      screenFingerprint,
+      actionKind,
+      label,
+    },
+  };
+}
+
+function screenFingerprintFromPageSource(pageSource: string): string {
+  return computeSemanticFingerprint(extractScreenLabels(pageSource));
+}
+
+/**
+ * During navigation, Appium can briefly return a mixed hierarchy containing
+ * labels from both the previous and next screens. If we key the locator cache
+ * from that transient DOM, repeat runs miss even though the target locator is
+ * stable. For cache-enabled DOM actions only, wait briefly for two consecutive
+ * semantic fingerprints to match and use that settled snapshot.
+ */
+async function getStablePageSourceForLocatorCache(mcp: MCPClient): Promise<string> {
+  let previous = await getPageSource(mcp);
+  let previousFingerprint = screenFingerprintFromPageSource(previous);
+
+  for (let i = 0; i < 2; i++) {
+    await sleep(250);
+    const next = await getPageSource(mcp);
+    const nextFingerprint = screenFingerprintFromPageSource(next);
+    if (nextFingerprint === previousFingerprint) return next;
+    previous = next;
+    previousFingerprint = nextFingerprint;
+  }
+
+  return previous;
+}
+
+/**
+ * Try the cached locator. On hit, runs `useUuid(uuid)`:
+ *   - if it returns a successful ActionResult, recordHit + return the result
+ *   - otherwise, markStale and return null so caller falls back
+ * On miss (no cache entry, or `findElement` returns null), returns null.
+ */
+async function tryCachedLocator(
+  ctx: LocatorCacheCtx,
+  mcp: MCPClient,
+  keyInfo: { key: LocatorCacheKey; screenLabels: string[] },
+  useUuid: (uuid: string) => Promise<ActionResult>
+): Promise<ActionResult | null> {
+  const hit = lookupLocator(ctx.store, keyInfo.key);
+  if (!hit) return null;
+  const uuid = await findElementByStrategy(mcp, hit.locator.strategy, hit.locator.selector).catch(
+    () => null
+  );
+  if (!uuid) {
+    // `findElement` null is ambiguous: the locator could be stale (UI changed)
+    // OR the element just hasn't rendered yet within the implicit-wait budget.
+    // Don't markStale here — just fall through so the caller's polling loop
+    // can retry on the next attempt. If the locator IS truly stale, the
+    // scoring fallback will resolve a different element and recordHit will
+    // overwrite this entry on the same key in place.
+    return null;
+  }
+  let result: ActionResult;
+  try {
+    result = await useUuid(uuid);
+  } catch {
+    // Gesture failed against the cached UUID — mark stale and return null so
+    // the caller falls through to today's scoring path within the SAME poll
+    // attempt. Returning the error result here would short-circuit the
+    // fallback (every callsite treats a non-null return as a final answer).
+    markStale(ctx.store, hit.id);
+    ctx.dirty = true;
+    return null;
+  }
+  if (result.success) {
+    recordHit(ctx.store, keyInfo.key, keyInfo.screenLabels, hit.locator);
+    ctx.dirty = true;
+    return { ...result, cacheHit: true };
+  }
+  markStale(ctx.store, hit.id);
+  ctx.dirty = true;
+  return null;
+}
+
+/**
+ * The tap-family gestures share one resolution pipeline (implicit wait, vision
+ * fallback, proximity/compound, locator cache) and differ only in the
+ * appium-mcp gesture fired at the end.
+ */
+type TapGesture = 'tap' | 'double_tap';
+
+/** Past-tense verb for success messages: "Tapped" / "Double-tapped". */
+function gestureVerb(gesture: TapGesture): string {
+  return gesture === 'double_tap' ? 'Double-tapped' : 'Tapped';
+}
+
+/** Cache action kind for a tap-family gesture — distinct so entries never mix. */
+function gestureCacheKind(gesture: TapGesture): 'tap' | 'doubleTap' {
+  return gesture === 'double_tap' ? 'doubleTap' : 'tap';
+}
+
+/** Fire a tap-family gesture at raw coordinates. `tap` keeps its W3C fallback. */
+async function gestureAtCoordinates(
+  mcp: MCPClient,
+  x: number,
+  y: number,
+  gesture: TapGesture
+): Promise<boolean> {
+  if (gesture === 'tap') return tapAtCoordinates(mcp, x, y);
+  try {
+    const result = await mcp.callTool('appium_gesture', {
+      action: 'double_tap',
+      x: Math.round(x),
+      y: Math.round(y),
+    });
+    const text = result.content?.map((c: any) => (c.type === 'text' ? c.text : '')).join('') ?? '';
+    return !text.toLowerCase().includes('error') && !text.toLowerCase().includes('failed');
+  } catch {
+    return false;
+  }
+}
+
+/** Try to tap an element using vision locate. Returns null if vision can't find it. */
+async function tryTapByVision(
+  mcp: MCPClient,
+  label: string,
+  gesture: TapGesture = 'tap'
+): Promise<ActionResult | null> {
+  const uuid = await findByVision(mcp, `UI element labeled or showing "${label}"`);
+  if (!uuid) return null;
+
+  if (isAIElement(uuid)) {
+    const coords = parseAIElementCoords(uuid);
+    if (coords) {
+      const tapped = await gestureAtCoordinates(mcp, coords.x, coords.y, gesture);
+      if (tapped) {
+        return {
+          success: true,
+          message: `${gestureVerb(gesture)} "${label}" via vision at [${coords.x}, ${coords.y}]`,
+        };
+      }
+    }
+    return null;
+  }
+
+  await mcp.callTool('appium_gesture', { action: gesture, elementUUID: uuid });
+  return { success: true, message: `${gestureVerb(gesture)} "${label}" via vision` };
+}
+
+/** One DOM snapshot: find label and click. Returns null if no match / no UUID (caller may retry). */
+/** Returns: ActionResult on success, "no_match" if label not in DOM, null if matched but UUID failed */
+/** DOM tap miss — the label (or its spatial qualifier) didn't resolve; `reason` says which part. */
+type DomTapMiss = { noMatch: true; reason: string };
+
+async function tryTapByLabelOnDom(
+  mcp: MCPClient,
+  label: string,
+  proximity?: Proximity,
+  gesture: TapGesture = 'tap'
+): Promise<ActionResult | DomTapMiss | null> {
+  const cacheCtx = getActiveLocatorCache();
+  const pageSource = cacheCtx
+    ? await getStablePageSourceForLocatorCache(mcp)
+    : await getPageSource(mcp);
+
+  // SDK locator cache fast-path: skip parse + score + multi-strategy probe when
+  // we already know the (strategy, selector) that won for this label on this
+  // screen. On miss / stale, falls through to the existing path below.
+  // Spatially-qualified taps never use the cache: they resolve to the picked
+  // element's coordinates (no locator to record), and replaying a stored
+  // locator would bypass the positional disambiguation entirely.
+  const keyInfo =
+    cacheCtx && !proximity
+      ? buildCacheKey(cacheCtx, pageSource, gestureCacheKind(gesture), label)
+      : null;
+  if (cacheCtx && keyInfo) {
+    const hit = await tryCachedLocator(cacheCtx, mcp, keyInfo, async (uuid) => {
+      // Capture the settled tap surface before the gesture navigates away.
+      const beforeScreenshot = await capturePreAction(mcp);
+      await mcp.callTool('appium_gesture', { action: gesture, elementUUID: uuid });
+      return { success: true, message: `${gestureVerb(gesture)} "${label}"`, beforeScreenshot };
+    });
+    if (hit) return hit;
+  }
+
+  const platform = detectPlatform(pageSource);
+  const elements =
+    platform === 'android' ? parseAndroidPageSource(pageSource) : parseIOSPageSource(pageSource);
+
+  // Score textually (with the clickable nudge) and, when a proximity qualifier is
+  // present, rank spatially (clickable preferred, full pool fallback). Any miss
+  // (no text match, anchor not found, no spatial survivor) becomes a DomTapMiss
+  // so the caller's poll loop keeps waiting — the screen may still be rendering —
+  // and the final error can say which part failed.
+  const picked = resolveTapTarget(elements, label, proximity);
+  const pick = picked.el;
+  if (!pick) return { noMatch: true, reason: picked.reason ?? `no element matches "${label}"` };
+
+  // A spatial pick must tap the CHOSEN instance. Re-locating it by id/text
+  // would silently undo the disambiguation whenever the identifier is shared —
+  // list rows typically reuse the same resource-id AND text, so the xpath
+  // `(//*[@text='X'])[1]` lands on the FIRST instance, not the one the
+  // qualifier selected. The picked element's coordinates ARE the resolution,
+  // so tap them directly. Compound picks (label spanning adjacent elements)
+  // have no DOM identity at all, so they're coordinate taps too.
+  if (proximity || picked.coordinateOnly) {
+    const beforeScreenshot = await capturePreAction(mcp);
+    const [x, y] = pick.center;
+    const tapped = await gestureAtCoordinates(mcp, x, y, gesture);
+    if (!tapped) return null;
+    const where = proximity
+      ? ` (${relationPhrase(proximity.relation)} ${describeAnchor(proximity)})`
+      : '';
+    return {
+      success: true,
+      message: `${gestureVerb(gesture)} "${label}"${where} at [${x}, ${y}]`,
+      beforeScreenshot,
+    };
+  }
+
+  const resolved = await findByIdStrategiesDetailed(
+    mcp,
+    pick.accessibilityId || pick.id,
+    pick.text
+  );
+  if (!resolved) return null;
+
+  // Capture the settled tap surface (Samples List, etc.) right before the
+  // gesture so the report shows the screen the tap happened ON — with the dot
+  // on the target — not the page it navigates to.
+  const beforeScreenshot = await capturePreAction(mcp);
+  await mcp.callTool('appium_gesture', { action: gesture, elementUUID: resolved.uuid });
+  const coords = pick.center;
+  // Record the winning locator so the next run for the same label on the same
+  // screen hits the cache fast-path above.
+  if (cacheCtx && keyInfo) {
+    recordHit(cacheCtx.store, keyInfo.key, keyInfo.screenLabels, {
+      strategy: resolved.strategy,
+      selector: resolved.selector,
+      text: resolved.text,
+    });
+    cacheCtx.dirty = true;
+  }
+  return {
+    success: true,
+    message: `${gestureVerb(gesture)} "${label}" at [${coords[0]}, ${coords[1]}]`,
+    beforeScreenshot,
+  };
+}
+
+async function tapByLabel(
+  mcp: MCPClient,
+  label: string,
+  poll: FlowTapPollOptions,
+  proximity?: Proximity,
+  gesture: TapGesture = 'tap'
+): Promise<ActionResult> {
+  // ── Vision-first mode: skip DOM entirely ──
+  // Poll the full budget so the element is implicitly waited for until it
+  // renders (or the wait budget is exhausted) — no explicit `wait` needed.
+  if (isVisionMode()) {
+    for (let attempt = 0; attempt < poll.maxAttempts; attempt++) {
+      const visionTap = await tryTapByVision(mcp, label, gesture);
+      if (visionTap) return visionTap;
+      if (attempt + 1 < poll.maxAttempts) {
+        ui.printAgentBullet(
+          `auto-wait: "${label}" not located by vision yet — re-capturing screenshot ` +
+            `(attempt ${attempt + 2}/${poll.maxAttempts}, every ${poll.intervalMs}ms)`
+        );
+        await sleep(poll.intervalMs);
+      }
+    }
+    return { success: false, message: `No matching element for "${label}" (vision mode)` };
+  }
+
+  // ── DOM mode: DOM-first with vision fallback ──
+  // Poll the full budget — a "no_match" means the element hasn't rendered YET,
+  // so we keep re-checking (implicit wait) instead of bailing on the first miss.
+  // On the FIRST no_match we try vision once: catches icon-only elements that
+  // are already on screen (no text to match) without burning the whole wait
+  // budget on DOM polls before falling over to vision.
+  // Vision locates by bare label and can't honor a spatial qualifier, so it's
+  // disabled when a proximity is set — falling back to it could tap the very
+  // element the qualifier was meant to exclude.
+  const visionOk = isVisionLocateEnabled() && !proximity;
+  let triedVisionEarly = false;
+  let lastMissReason: string | undefined;
+  for (let attempt = 0; attempt < poll.maxAttempts; attempt++) {
+    const domTap = await tryTapByLabelOnDom(mcp, label, proximity, gesture);
+    if (domTap && !('noMatch' in domTap)) return domTap;
+    if (domTap) {
+      lastMissReason = domTap.reason;
+      if (!triedVisionEarly && visionOk) {
+        triedVisionEarly = true;
+        const visionTap = await tryTapByVision(mcp, label, gesture);
+        if (visionTap) return visionTap;
+      }
+    }
+    if (attempt + 1 < poll.maxAttempts) {
+      const why = domTap ? 'not in page source yet' : 'found but not yet tappable';
+      ui.printAgentBullet(
+        `auto-wait: "${label}" ${why} — re-reading page source ` +
+          `(attempt ${attempt + 2}/${poll.maxAttempts}, every ${poll.intervalMs}ms)`
+      );
+      await sleep(poll.intervalMs);
+    }
+  }
+
+  // Last resort: one more vision attempt after the wait budget is exhausted
+  // (the element may have only just rendered on the final DOM poll).
+  if (visionOk) {
+    ui.printAgentBullet(`"${label}" not found in page source, trying vision…`);
+    const visionTap = await tryTapByVision(mcp, label, gesture);
+    if (visionTap) return visionTap;
+  }
+
+  return {
+    success: false,
+    message: proximity
+      ? `No "${label}" found ${relationPhrase(proximity.relation)} ${describeAnchor(proximity)} on screen` +
+        (lastMissReason ? ` — ${lastMissReason}` : '')
+      : `No matching element for "${label}"${spatialTypoHint(label)}`,
+  };
+}
+
+/** Long-press an element by visual label. Uses vision locate if available, falls back to DOM. */
+async function longPressByLabel(
+  mcp: MCPClient,
+  label: string,
+  duration: number = 2000
+): Promise<ActionResult> {
+  // Vision mode: locate via df-vision → coordinate-based long press
+  if (isVisionMode() || isVisionLocateEnabled()) {
+    try {
+      const visionUuid = await findElementByVision(mcp, label);
+      const coords = parseAIElementCoords(visionUuid);
+      if (coords) {
+        await mcp.callTool('appium_gesture', {
+          action: 'long_press',
+          x: coords.x,
+          y: coords.y,
+          duration,
+        });
+        return {
+          success: true,
+          message: `Long-pressed "${label}" via vision at [${coords.x}, ${coords.y}] (${duration}ms)`,
+        };
+      }
+    } catch {
+      // Fall through to DOM
+    }
+  }
+
+  // DOM mode: find element UUID → long press by UUID
+  const cacheCtx = getActiveLocatorCache();
+  const pageSource = cacheCtx
+    ? await getStablePageSourceForLocatorCache(mcp)
+    : await getPageSource(mcp);
+
+  // SDK locator cache fast-path (same shape as tryTapByLabelOnDom).
+  const keyInfo = cacheCtx ? buildCacheKey(cacheCtx, pageSource, 'longPress', label) : null;
+  if (cacheCtx && keyInfo) {
+    const hit = await tryCachedLocator(cacheCtx, mcp, keyInfo, async (uuid) => {
+      await mcp.callTool('appium_gesture', { action: 'long_press', elementUUID: uuid, duration });
+      return { success: true, message: `Long-pressed "${label}" (${duration}ms)` };
+    });
+    if (hit) return hit;
+  }
+
+  const platform = detectPlatform(pageSource);
+  const elements =
+    platform === 'android' ? parseAndroidPageSource(pageSource) : parseIOSPageSource(pageSource);
+
+  // Lower score = better match (0 = exact); prefer clickable on ties — same
+  // ranking as the tap path so "long press the X button" disambiguates the same.
+  const wantsClickable = trailingRoleWord(label) != null;
+  const scored = elements
+    .map((el) => ({ el, s: scoreTapMatch(el, label) }))
+    .filter((x) => x.s >= 0)
+    .map((x) => ({ ...x, eff: x.s + (wantsClickable && !x.el.clickable ? 0.5 : 0) }))
+    .sort((a, b) => {
+      if (a.eff !== b.eff) return a.eff - b.eff;
+      if (a.el.clickable !== b.el.clickable) return a.el.clickable ? -1 : 1;
+      return 0;
+    });
+
+  const pick = scored[0]?.el;
+  if (!pick) return { success: false, message: `No matching element for "${label}"` };
+
+  const resolved = await findByIdStrategiesDetailed(
+    mcp,
+    pick.accessibilityId || pick.id,
+    pick.text
+  );
+  if (!resolved)
+    return { success: false, message: `Found "${label}" but could not locate element` };
+
+  await mcp.callTool('appium_gesture', {
+    action: 'long_press',
+    elementUUID: resolved.uuid,
+    duration,
+  });
+  if (cacheCtx && keyInfo) {
+    recordHit(cacheCtx.store, keyInfo.key, keyInfo.screenLabels, {
+      strategy: resolved.strategy,
+      selector: resolved.selector,
+      text: resolved.text,
+    });
+    cacheCtx.dirty = true;
+  }
+  return { success: true, message: `Long-pressed "${label}" (${duration}ms)` };
+}
+
+/**
+ * Vision: locate a text input field by KIND (not by literal label) and tap to focus it.
+ * Returns true if a field was tapped. A literal label like "search box"/"textbox" rarely
+ * matches a field whose only visible text is a placeholder (e.g. "Search Fox Sports"), so
+ * describing the element kind is far more reliable for the type path.
+ *
+ * When `hint` is given (the user's target field), it's folded into the query so a screen
+ * with several fields still resolves the RIGHT one (e.g. "password field") instead of
+ * blindly grabbing the first input — this keeps the targeted fallback from mis-focusing.
+ */
+async function focusInputFieldByVision(mcp: MCPClient, hint?: string): Promise<boolean> {
+  const query = hint
+    ? `text input field or search box for "${hint}"`
+    : 'text input field, search box, or editable area';
+  const visionUuid = await findByVision(mcp, query);
+  if (!visionUuid) return false;
+  if (isAIElement(visionUuid)) {
+    const coords = parseAIElementCoords(visionUuid);
+    return coords ? await tapAtCoordinates(mcp, coords.x, coords.y) : false;
+  }
+  await mcp.callTool('appium_gesture', { action: 'tap', elementUUID: visionUuid });
+  return true;
+}
+
+async function flowTypeText(
+  mcp: MCPClient,
+  text: string,
+  target?: string,
+  deviceUdid?: string,
+  poll: FlowTapPollOptions = { maxAttempts: 10, intervalMs: 300 },
+  proximity?: Proximity,
+  selector?: ElementSelector,
+  sensitive = false
+): Promise<ActionResult> {
+  if (selector) return typeBySelector(mcp, text, selector, poll, deviceUdid);
+  if (appclawDebug)
+    ui.printAgentBullet(
+      `[type] text="${sensitive ? '***' : text}", target=${target ?? '(none)'}` +
+        (proximity ? `, proximity=${proximity.relation}:"${proximity.anchor}"` : '')
+    );
+  // ── If a target field is specified, tap it first to focus (implicit wait) ──
+  if (target) {
+    const tapResult = await tapByLabel(mcp, target, poll, proximity);
+    // Vision mode: a literal label like "search box"/"textbox" usually won't match a field
+    // that only shows a placeholder. Fall back to locating the input field by kind before
+    // giving up, so `type "x" → search box` works the same as the no-target path.
+    const focused =
+      tapResult.success || (isVisionMode() && (await focusInputFieldByVision(mcp, target)));
+    if (!focused) {
+      return { success: false, message: `Could not find target field "${target}" to type into` };
+    }
+    await sleep(Config.CLOUD_PROVIDER ? 1200 : 300); // Cloud needs longer to settle focus
+  }
+
+  // ── Vision mode: locate input field via vision, then type via keyboard ──
+  if (isVisionMode()) {
+    // If no target was specified, use vision to find and tap an input field
+    if (!target) {
+      await focusInputFieldByVision(mcp);
+    }
+    // Type via W3C Actions — works on local and cloud, Android and iOS
+    const sv = await typeViaSetValue(mcp, text);
+    if (sv.success) {
+      const msg = target ? `Typed "${text}" in "${target}"` : `Typed "${text}"`;
+      return { success: true, message: msg };
+    }
+    // Fallback 3: appium_set_value on a vision-located element (no-target case only)
+    if (!target) {
+      const visionUuid = await findByVision(mcp, 'text input field, search box, or editable area');
+      if (visionUuid && !isAIElement(visionUuid)) {
+        await mcp
+          .callTool('appium_set_value', { elementUUID: visionUuid, text: '' })
+          .catch(() => {});
+        const setResult = await mcp.callTool('appium_set_value', { elementUUID: visionUuid, text });
+        const setText =
+          setResult.content
+            ?.map((c: { type: string; text?: string }) => (c.type === 'text' ? c.text : ''))
+            .join('') ?? '';
+        if (!setText.toLowerCase().includes('error') && !setText.toLowerCase().includes('failed')) {
+          return { success: true, message: `Typed "${text}" via vision` };
+        }
+      }
+    }
+    return { success: false, message: 'Could not type text in vision mode' };
+  }
+
+  // ── DOM mode ──
+  const cacheCtx = getActiveLocatorCache();
+  const pageSource = cacheCtx
+    ? await getStablePageSourceForLocatorCache(mcp)
+    : await getPageSource(mcp);
+
+  // SDK locator cache fast-path. Cache key for `type` is keyed on the optional
+  // target label (or the implicit-input sentinel when none) plus any proximity
+  // qualifier, so two distinct editable fields on the same screen don't collide.
+  const baseCacheLabel = target ?? '__implicit_input__';
+  const cacheLabel = proximity
+    ? `${baseCacheLabel}|${proximity.relation}:${proximity.anchor}`
+    : baseCacheLabel;
+  const keyInfo = cacheCtx ? buildCacheKey(cacheCtx, pageSource, 'type', cacheLabel) : null;
+  if (cacheCtx && keyInfo) {
+    const hit = await tryCachedLocator(cacheCtx, mcp, keyInfo, async (uuid) => {
+      await mcp.callTool('appium_gesture', { action: 'tap', elementUUID: uuid });
+      await mcp.callTool('appium_set_value', { elementUUID: uuid, text: '' }).catch(() => {});
+      const setResult = await mcp.callTool('appium_set_value', {
+        ...(Config.CLOUD_PROVIDER ? { w3cActions: true } : { elementUUID: uuid }),
+        text,
+      });
+      const setText =
+        setResult.content
+          ?.map((c: { type: string; text?: string }) => (c.type === 'text' ? c.text : ''))
+          .join('') ?? '';
+      if (setText.toLowerCase().includes('error') || setText.toLowerCase().includes('failed')) {
+        return { success: false, message: setText.slice(0, 200) };
+      }
+      return { success: true, message: `Typed "${text}"` };
+    });
+    if (hit) return hit;
+  }
+
+  const platform = detectPlatform(pageSource);
+  const elements =
+    platform === 'android' ? parseAndroidPageSource(pageSource) : parseIOSPageSource(pageSource);
+
+  // With a named target (or a spatial qualifier), type into THAT field — not the
+  // first editable on screen. Without one, the implicit-input case keeps using
+  // the first editable field.
+  let editable: UIElement | null;
+  if (target || proximity) {
+    const r = resolveEditableForTarget(elements, target, proximity);
+    if (!r.el) {
+      const what = target ? `target "${target}"` : 'an input';
+      return { success: false, message: `Could not find ${what} to type into: ${r.reason}` };
+    }
+    editable = r.el;
+  } else {
+    editable = elements.find((e) => e.editable && e.enabled !== false) ?? null;
+    if (!editable) {
+      return { success: false, message: 'No editable field found for type' };
+    }
+  }
+  const resolved = await findByIdStrategiesDetailed(
+    mcp,
+    editable.accessibilityId || editable.id,
+    editable.text
+  );
+  if (!resolved) {
+    return { success: false, message: 'Could not resolve editable element' };
+  }
+  await mcp.callTool('appium_gesture', { action: 'tap', elementUUID: resolved.uuid });
+  await mcp.callTool('appium_set_value', { elementUUID: resolved.uuid, text: '' }).catch(() => {});
+  const setResult = await mcp.callTool('appium_set_value', {
+    ...(Config.CLOUD_PROVIDER ? { w3cActions: true } : { elementUUID: resolved.uuid }),
+    text,
+  });
+  const setText =
+    setResult.content
+      ?.map((c: { type: string; text?: string }) => (c.type === 'text' ? c.text : ''))
+      .join('') ?? '';
+  if (setText.toLowerCase().includes('error') || setText.toLowerCase().includes('failed')) {
+    return { success: false, message: setText.slice(0, 200) };
+  }
+  if (cacheCtx && keyInfo) {
+    recordHit(cacheCtx.store, keyInfo.key, keyInfo.screenLabels, {
+      strategy: resolved.strategy,
+      selector: resolved.selector,
+      text: resolved.text,
+    });
+    cacheCtx.dirty = true;
+  }
+  return { success: true, message: `Typed "${text}"` };
+}
+
+/** Check DOM for text match across element fields. */
+function domContainsText(elements: UIElement[], needle: string): boolean {
+  const n = needle.toLowerCase();
+  return elements.some((el) => {
+    const fields = [el.text, el.hint ?? '', el.accessibilityId, el.id];
+    return fields.some((f) => f.toLowerCase().includes(n));
+  });
+}
+
+/** Find an element whose text/hint/id contains the given needle (case-insensitive). */
+function findElement(elements: UIElement[], needle: string): UIElement | undefined {
+  const n = needle.toLowerCase();
+  return elements.find((el) => {
+    const fields = [el.text, el.hint ?? '', el.accessibilityId, el.id];
+    return fields.some((f) => f.toLowerCase().includes(n));
+  });
+}
+
+type SpatialRelation = 'below' | 'above' | 'left of' | 'right of';
+
+interface SpatialAssertion {
+  subjectText: string;
+  relation: SpatialRelation;
+  anchorText: string;
+}
+
+/**
+ * Try to parse a spatial/relational assertion like:
+ *   "if the text Jest is below Jasmine"
+ *   "the text Submit is above Cancel"
+ *   "Login is right of Register"
+ */
+function parseSpatialAssertion(assertion: string): SpatialAssertion | null {
+  // Patterns: "[if] [the text] <subject> is (below|above|left of|right of) [the text] <anchor>"
+  const re =
+    /^(?:if\s+)?(?:the\s+text\s+)?["']?(.+?)["']?\s+is\s+(below|above|left\s+of|right\s+of)\s+(?:the\s+text\s+)?["']?(.+?)["']?$/i;
+  const match = assertion.match(re);
+  if (!match) return null;
+
+  const relation = match[2].toLowerCase().replace(/\s+/g, ' ') as SpatialRelation;
+  return {
+    subjectText: match[1].trim(),
+    relation,
+    anchorText: match[3].trim(),
+  };
+}
+
+/**
+ * Evaluate a spatial relationship between two elements and return
+ * { satisfied, reason } with a human-readable explanation.
+ */
+function evaluateSpatialRelation(
+  elements: UIElement[],
+  spatial: SpatialAssertion
+): { satisfied: boolean; reason: string } {
+  const subject = findElement(elements, spatial.subjectText);
+  const anchor = findElement(elements, spatial.anchorText);
+
+  if (!subject && !anchor) {
+    return {
+      satisfied: false,
+      reason: `Neither "${spatial.subjectText}" nor "${spatial.anchorText}" found on screen`,
+    };
+  }
+  if (!subject) {
+    return {
+      satisfied: false,
+      reason: `"${spatial.subjectText}" not found on screen`,
+    };
+  }
+  if (!anchor) {
+    return {
+      satisfied: false,
+      reason: `"${spatial.anchorText}" not found on screen`,
+    };
+  }
+
+  const [sx, sy] = subject.center;
+  const [ax, ay] = anchor.center;
+
+  let satisfied = false;
+  let actual = '';
+
+  switch (spatial.relation) {
+    case 'below':
+      satisfied = sy > ay;
+      actual = satisfied
+        ? `"${spatial.subjectText}" is below "${spatial.anchorText}"`
+        : `"${spatial.subjectText}" is actually above "${spatial.anchorText}", not below`;
+      break;
+    case 'above':
+      satisfied = sy < ay;
+      actual = satisfied
+        ? `"${spatial.subjectText}" is above "${spatial.anchorText}"`
+        : `"${spatial.subjectText}" is actually below "${spatial.anchorText}", not above`;
+      break;
+    case 'left of':
+      satisfied = sx < ax;
+      actual = satisfied
+        ? `"${spatial.subjectText}" is left of "${spatial.anchorText}"`
+        : `"${spatial.subjectText}" is actually right of "${spatial.anchorText}", not left`;
+      break;
+    case 'right of':
+      satisfied = sx > ax;
+      actual = satisfied
+        ? `"${spatial.subjectText}" is right of "${spatial.anchorText}"`
+        : `"${spatial.subjectText}" is actually left of "${spatial.anchorText}", not right`;
+      break;
+  }
+
+  return { satisfied, reason: actual };
+}
+
+/** Parse current page source into elements. */
+async function getScreenElements(mcp: MCPClient, includeHidden = false): Promise<UIElement[]> {
+  const pageSource = await getPageSource(mcp);
+  const platform = detectPlatform(pageSource);
+  return platform === 'android'
+    ? parseAndroidPageSource(pageSource)
+    : parseIOSPageSource(pageSource, { includeHidden });
+}
+
+function selectorDiagnostics(
+  selector: ElementSelector,
+  elements: UIElement[],
+  failures?: string[]
+): SelectorDiagnostics {
+  return {
+    selector,
+    matchedCount: elements.length,
+    // Keep reports useful but bounded on list-heavy screens.
+    matched: elements.slice(0, 20).map(snapshotElement),
+    ...(failures?.length ? { failures } : {}),
+  };
+}
+
+interface StructuredActionTarget {
+  element?: UIElement;
+  diagnostics: SelectorDiagnostics;
+  error?: string;
+}
+
+/**
+ * Resolve one deterministic action target with implicit waiting.
+ * Structured selectors never consult vision, and ambiguity is an explicit error.
+ */
+async function resolveStructuredActionTarget(
+  mcp: MCPClient,
+  selector: ElementSelector,
+  poll: FlowTapPollOptions
+): Promise<StructuredActionTarget> {
+  let lastCandidates: UIElement[] = [];
+  let lastError = `No visible element matched selector(${describeElementSelector(selector)})`;
+  for (let attempt = 0; attempt < poll.maxAttempts; attempt++) {
+    const elements = (await getScreenElements(mcp)).filter((element) => element.visible !== false);
+    const resolution = resolveElementSelector(elements, selector);
+    lastCandidates = resolution.matches;
+    if (selector.index == null && resolution.matches.length > 1) {
+      lastError =
+        `Structured selector is ambiguous: matched ${resolution.matches.length} elements; ` +
+        'add index or a relation selector';
+      return {
+        diagnostics: selectorDiagnostics(selector, resolution.matches, [lastError]),
+        error: lastError,
+      };
+    }
+    if (resolution.matches.length === 1) {
+      return {
+        element: resolution.matches[0],
+        diagnostics: selectorDiagnostics(selector, resolution.matches),
+      };
+    }
+    if (resolution.indexOutOfRange) {
+      lastError = `Selector index ${selector.index} is out of range (${resolution.allMatches.length} candidate(s))`;
+    }
+    if (attempt + 1 < poll.maxAttempts) await sleep(poll.intervalMs);
+  }
+  return {
+    diagnostics: selectorDiagnostics(selector, lastCandidates, [lastError]),
+    error: lastError,
+  };
+}
+
+async function tapBySelector(
+  mcp: MCPClient,
+  selector: ElementSelector,
+  poll: FlowTapPollOptions,
+  gesture: TapGesture = 'tap'
+): Promise<ActionResult> {
+  const target = await resolveStructuredActionTarget(mcp, selector, poll);
+  if (!target.element) {
+    return {
+      success: false,
+      message: target.error ?? 'Structured selector did not resolve',
+      selectorDiagnostics: target.diagnostics,
+    };
+  }
+  const beforeScreenshot = await capturePreAction(mcp);
+  const [x, y] = target.element.center;
+  const success = await gestureAtCoordinates(mcp, x, y, gesture);
+  return {
+    success,
+    message: success
+      ? `${gestureVerb(gesture)} selector(${describeElementSelector(selector)}) at [${x}, ${y}]`
+      : `Could not ${gesture === 'tap' ? 'tap' : 'double-tap'} selector(${describeElementSelector(selector)})`,
+    beforeScreenshot,
+    selectorDiagnostics: target.diagnostics,
+  };
+}
+
+async function longPressBySelector(
+  mcp: MCPClient,
+  selector: ElementSelector,
+  poll: FlowTapPollOptions,
+  duration = 2000
+): Promise<ActionResult> {
+  const target = await resolveStructuredActionTarget(mcp, selector, poll);
+  if (!target.element) {
+    return {
+      success: false,
+      message: target.error ?? 'Structured selector did not resolve',
+      selectorDiagnostics: target.diagnostics,
+    };
+  }
+  const [x, y] = target.element.center;
+  const result = await mcp.callTool('appium_gesture', {
+    action: 'long_press',
+    x,
+    y,
+    duration,
+  });
+  const response =
+    result.content?.map((content: any) => (content.type === 'text' ? content.text : '')).join('') ??
+    '';
+  const success =
+    !response.toLowerCase().includes('error') && !response.toLowerCase().includes('failed');
+  return {
+    success,
+    message: success
+      ? `Long-pressed selector(${describeElementSelector(selector)}) at [${x}, ${y}] (${duration}ms)`
+      : `Long-press failed: ${response.slice(0, 200)}`,
+    selectorDiagnostics: target.diagnostics,
+  };
+}
+
+async function typeBySelector(
+  mcp: MCPClient,
+  text: string,
+  selector: ElementSelector,
+  poll: FlowTapPollOptions,
+  deviceUdid?: string
+): Promise<ActionResult> {
+  const target = await resolveStructuredActionTarget(mcp, selector, poll);
+  if (!target.element) {
+    return {
+      success: false,
+      message: target.error ?? 'Structured selector did not resolve',
+      selectorDiagnostics: target.diagnostics,
+    };
+  }
+  if (!target.element.editable) {
+    const error = `Matched element is not editable (${target.element.type || 'unknown type'})`;
+    target.diagnostics.failures = [error];
+    return { success: false, message: error, selectorDiagnostics: target.diagnostics };
+  }
+  const [x, y] = target.element.center;
+  const focused = await tapAtCoordinates(mcp, x, y);
+  if (!focused) {
+    const error = 'Could not focus structured selector target';
+    target.diagnostics.failures = [error];
+    return { success: false, message: error, selectorDiagnostics: target.diagnostics };
+  }
+  await sleep(Config.CLOUD_PROVIDER ? 1200 : 300);
+  let typed = await typeViaSetValue(mcp, text);
+  if (!typed.success && target.element.platform === 'android') {
+    typed = await typeViaKeyboard(text, deviceUdid);
+  }
+  return {
+    success: typed.success,
+    message: typed.success
+      ? `Typed "${text}" in selector(${describeElementSelector(selector)}) at [${x}, ${y}]`
+      : typed.message,
+    selectorDiagnostics: target.diagnostics,
+  };
+}
+
+async function assertStructuredSelector(
+  mcp: MCPClient,
+  selector: ElementSelector,
+  properties: ElementPropertyExpectations | undefined,
+  count: NumericExpectation | undefined,
+  poll: FlowTapPollOptions
+): Promise<ActionResult> {
+  let last = evaluateStructuredAssertion([], selector, properties, count);
+  for (let attempt = 0; attempt < poll.maxAttempts; attempt++) {
+    const elements = await getScreenElements(mcp, true);
+    last = evaluateStructuredAssertion(elements, selector, properties, count);
+    if (last.success) {
+      return {
+        success: true,
+        message: last.message,
+        selectorDiagnostics: last.diagnostics,
+      };
+    }
+    if (attempt + 1 < poll.maxAttempts) await sleep(poll.intervalMs);
+  }
+  return {
+    success: false,
+    message: last.message,
+    selectorDiagnostics: last.diagnostics,
+  };
+}
+
+const ASSERT_DOM_POLLS_BEFORE_VISION = 3;
+
+/**
+ * Vision-based assertion: take a screenshot and ask the LLM
+ * "Is this visible on screen?" — returns a true yes/no answer.
+ */
+const appclawDebug = process.env.APPCLAW_DEBUG === '1' || process.env.APPCLAW_DEBUG === 'true';
+
+async function visionAssert(mcp: MCPClient, text: string): Promise<boolean> {
+  const apiKey = getStarkVisionApiKey();
+  const baseUrl = getStarkVisionBaseUrl();
+  if (!apiKey && !baseUrl) {
+    if (appclawDebug)
+      ui.printWarning(
+        '[vision-assert] No API key or local server configured, skipping vision assert'
+      );
+    return false;
+  }
+
+  const { StarkVisionClient } = (await import('@appclaw/vision')).default;
+  const client = new StarkVisionClient({
+    apiKey: apiKey || 'local',
+    model: getStarkVisionModel(),
+    disableThinking: true,
+    ...(baseUrl && { baseUrl }),
+    ...(baseUrl && { coordinateOrder: getStarkVisionCoordinateOrder() }),
+  });
+
+  // Single attempt — callers (waitUntilCondition, assertTextVisible) handle retrying.
+  // Use getElementInfo (semantic prompt) instead of isElementVisible (exact-match prompt):
+  // getElementInfo interprets the condition as intent, handling typos ("viisble"),
+  // extra words ("is visible", "until"), and any spoken language naturally.
+  const maxAttempts = 1;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) await sleep(500);
+
+    if (appclawDebug)
+      ui.printAgentBullet(
+        `[vision-assert] Taking screenshot for: "${text}"${attempt > 0 ? ` (retry ${attempt})` : ''}`
+      );
+    // Use the raw screenshot without downscaling — text-reading assertions need
+    // full resolution to identify small labels (e.g. bottom nav items on high-DPI devices).
+    const imageBase64 = await screenshot(mcp);
+    if (!imageBase64) {
+      if (appclawDebug) ui.printWarning('[vision-assert] Failed to capture screenshot');
+      continue;
+    }
+    if (appclawDebug)
+      ui.printAgentBullet(
+        `[vision-assert] Screenshot captured (${Math.round(imageBase64.length / 1024)}KB)`
+      );
+
+    if (appclawDebug)
+      ui.printAgentBullet(
+        `[vision-assert] Asking LLM: is "${text}" visible? (model: ${getStarkVisionModel()})`
+      );
+    const visT0 = performance.now();
+    const response = await client.isElementVisible(imageBase64, text, false);
+    const visElapsed = Math.round(performance.now() - visT0);
+    if (appclawDebug)
+      ui.printAgentBullet(`[vision-assert] LLM response (${visElapsed}ms): ${response}`);
+
+    // Parse { conditionSatisfied: boolean } from isElementVisible response
+    let result = false;
+    const jsonStr = response
+      .replace(/^```(?:json)?\s*\n?/i, '')
+      .replace(/\n?```\s*$/i, '')
+      .trim();
+    try {
+      const parsed = JSON.parse(jsonStr);
+      if (typeof parsed.conditionSatisfied === 'boolean') {
+        result = parsed.conditionSatisfied;
+      } else if (typeof parsed.visible === 'boolean') {
+        result = parsed.visible;
+      } else {
+        const lower = jsonStr.toLowerCase();
+        result = lower.includes('"conditionsatisfied": true') || lower.includes('"visible": true');
+      }
+      // The isElementVisible prompt returns conditionSatisfied=false when a popup is present,
+      // even if that popup IS what the user is waiting for. If the popup type matches the
+      // search text (e.g. waiting for "success" and typeOfPopUp="Success"), treat as visible.
+      if (!result && parsed.systemPopUp === true) {
+        const popupType = (parsed.typeOfPopUp ?? '').toLowerCase().trim();
+        const searchText = text.toLowerCase();
+        if (popupType && (searchText.includes(popupType) || popupType.includes(searchText))) {
+          if (appclawDebug)
+            ui.printAgentBullet(
+              `[vision-assert] popup match: typeOfPopUp="${parsed.typeOfPopUp}" matches "${text}" → treating as VISIBLE`
+            );
+          result = true;
+        }
+      }
+    } catch {
+      const lower = response.toLowerCase();
+      result = /\btrue\b/.test(lower) && !/\bfalse\b/.test(lower);
+    }
+
+    if (result) {
+      console.log(`  ${chalk.green('[vision-assert] Verdict: VISIBLE ✓')}`);
+      return true;
+    }
+
+    // Only log NOT VISIBLE on final attempt
+    if (attempt === maxAttempts - 1) {
+      console.log(`  ${chalk.red('[vision-assert] Verdict: NOT VISIBLE ✗')}`);
+    }
+  }
+
+  return false;
+}
+
+async function assertTextVisible(
+  mcp: MCPClient,
+  text: string,
+  poll: FlowTapPollOptions,
+  allowVision = true
+): Promise<ActionResult> {
+  const visionFirst = allowVision && isVisionMode();
+  const useVision = allowVision && isVisionLocateEnabled();
+  let lastElements: UIElement[] = [];
+
+  // ── Check for spatial/relational assertions (e.g. "Jest is below Jasmine") ──
+  const spatial = parseSpatialAssertion(text);
+  if (spatial) {
+    // For spatial assertions, get elements and evaluate the relationship
+    lastElements = await getScreenElements(mcp);
+    const { satisfied, reason } = evaluateSpatialRelation(lastElements, spatial);
+    if (satisfied) {
+      return { success: true, message: `Assertion passed: ${reason}` };
+    }
+    return { success: false, message: `Assertion failed: ${reason}` };
+  }
+
+  // ── Standard text-visibility assertion ──
+  if (visionFirst) {
+    // ── Vision mode: screenshot + LLM yes/no verification ──
+    const visible = await visionAssert(mcp, text);
+    if (visible) {
+      return { success: true, message: `Verified "${text}" is visible (via vision)` };
+    }
+    // Grab screen elements for the failure message
+    try {
+      lastElements = await getScreenElements(mcp);
+    } catch {
+      /* ignore */
+    }
+  } else {
+    // ── DOM-first mode ──
+    const domPolls = useVision ? ASSERT_DOM_POLLS_BEFORE_VISION : poll.maxAttempts;
+    for (let attempt = 0; attempt < domPolls; attempt++) {
+      lastElements = await getScreenElements(mcp);
+      if (domContainsText(lastElements, text)) {
+        return { success: true, message: `Verified "${text}" is visible` };
+      }
+      if (attempt + 1 < domPolls) await sleep(poll.intervalMs);
+    }
+
+    // Vision fallback in DOM mode
+    if (useVision) {
+      const visible = await visionAssert(mcp, text);
+      if (visible) {
+        return { success: true, message: `Verified "${text}" is visible (via vision)` };
+      }
+    }
+  }
+
+  // Build a summary of what's actually on screen
+  const screenTexts = lastElements.map((el) => el.text).filter((t) => t.length > 0);
+  const uniqueTexts = [...new Set(screenTexts)];
+  const screenSummary =
+    uniqueTexts.length > 0
+      ? `\n    Screen contains: ${uniqueTexts.join(' | ')}`
+      : '\n    Screen: (no text elements found)';
+
+  return {
+    success: false,
+    message: `Assertion failed: "${text}" not found on screen${screenSummary}`,
+  };
+}
+
+/**
+ * Scroll in a direction, checking after each scroll whether `text` is visible.
+ * Checks the current screen BEFORE the first scroll — if the target is already
+ * visible, returns immediately without scrolling (avoids pushing it off screen).
+ */
+/** Generic region nouns in phrases like "the area above View All" — no element
+ *  carries this text; the region is defined purely by the spatial qualifier. */
+const GENERIC_REGION_NOUN =
+  /^(?:area|section|carousel|strip|list|row|region|scroll\s*(?:area|view|section))$/i;
+
+/**
+ * Resolve where an anchored scroll-until-visible should swipe.
+ *
+ * - target only               → the element's center (same as anchored swipe)
+ * - target + qualifier        → the spatially-disambiguated instance's center
+ * - generic noun + qualifier  → the nearest element on that side of the
+ *   qualifier's anchor ("the area above View All" → whatever sits just above
+ *   "View All"), guaranteeing the point lands on real content in that region.
+ */
+async function resolveScrollAnchorCenter(
+  mcp: MCPClient,
+  target: string | undefined,
+  proximity: Proximity | undefined
+): Promise<[number, number] | null> {
+  if (!proximity) return target ? resolveTargetCenter(mcp, target) : null;
+  const pageSource = await getPageSource(mcp);
+  const platform = detectPlatform(pageSource);
+  const elements =
+    platform === 'android' ? parseAndroidPageSource(pageSource) : parseIOSPageSource(pageSource);
+  if (!target || GENERIC_REGION_NOUN.test(target)) {
+    const anchorEl = resolveAnchor(elements, proximity);
+    if (!anchorEl) return null;
+    const ranked = rankBySpatial(elements, anchorEl, proximity.relation);
+    return ranked[0]?.center ?? null;
+  }
+  return resolveTapTarget(elements, target, proximity).el?.center ?? null;
+}
+
+async function scrollUntilVisible(
+  mcp: MCPClient,
+  text: string | undefined,
+  direction: 'up' | 'down' | 'left' | 'right',
+  maxScrolls: number,
+  poll: FlowTapPollOptions,
+  distance?: ScrollDistance,
+  target?: string,
+  targetProximity?: Proximity,
+  selector?: ElementSelector
+): Promise<ActionResult> {
+  const visionFirst = isVisionMode();
+  const useVision = isVisionLocateEnabled();
+
+  // Anchored form: swipe from the named element's position (a carousel/strip)
+  // instead of screen center. Resolved ONCE, before any swiping — the anchor
+  // element itself scrolls away with the strip's content, but the strip stays
+  // where it is on screen, so the first-seen coordinates remain the right
+  // place to keep swiping. Finger-motion semantics, same as anchored `swipe`.
+  let anchorCoords: { x: number; y: number; endX: number; endY: number } | null = null;
+  const targetDesc = targetProximity
+    ? `${target ?? 'area'} ${relationPhrase(targetProximity.relation)} ${describeAnchor(targetProximity)}`
+    : target;
+  if (target || targetProximity) {
+    const center = await resolveScrollAnchorCenter(mcp, target, targetProximity);
+    if (center) {
+      anchorCoords = anchoredSwipeCoords(mcp, center, direction, distance);
+    } else {
+      ui.printAgentBullet(`"${targetDesc}" not found — scrolling ${direction} from screen center`);
+    }
+  }
+  const customCoords =
+    anchorCoords ?? (distance ? scrollCoordsForDistance(mcp, direction, distance) : null);
+  // Anchored horizontal drags use the swipe gesture, mirroring the anchored
+  // `swipe` step; the plain path keeps its historical scroll semantics.
+  const gestureAction =
+    anchorCoords && (direction === 'left' || direction === 'right') ? 'swipe' : 'scroll';
+
+  // Helper: check if text is currently visible on screen
+  let selectorMatches: UIElement[] = [];
+  const isVisible = async (): Promise<boolean> => {
+    if (selector) {
+      const elements = await getScreenElements(mcp);
+      selectorMatches = resolveElementSelector(elements, selector).matches.filter(
+        (element) => element.visible !== false
+      );
+      return selectorMatches.length > 0;
+    }
+    if (!text) return false;
+    if (visionFirst) {
+      return visionAssert(mcp, text);
+    }
+    // DOM check first
+    const elements = await getScreenElements(mcp);
+    if (domContainsText(elements, text)) return true;
+    // Vision fallback in DOM mode
+    if (useVision) return visionAssert(mcp, text);
+    return false;
+  };
+
+  // ── Pre-scroll check: target may already be on screen ──
+  if (await isVisible()) {
+    return {
+      success: true,
+      message: selector
+        ? `selector(${describeElementSelector(selector)}) already visible on screen (no scroll needed)`
+        : `"${text}" already visible on screen (no scroll needed)`,
+      ...(selector ? { selectorDiagnostics: selectorDiagnostics(selector, selectorMatches) } : {}),
+    };
+  }
+
+  const onNote = anchorCoords ? ` on "${targetDesc}"` : '';
+  for (let scroll = 0; scroll < maxScrolls; scroll++) {
+    await mcp.callTool('appium_gesture', {
+      action: gestureAction,
+      ...(customCoords ? customCoords : { direction }),
+    });
+    await sleep(800);
+
+    if (await isVisible()) {
+      return {
+        success: true,
+        message: selector
+          ? `Found selector(${describeElementSelector(selector)}) after ${scroll + 1} scroll(s) ${direction}${onNote}`
+          : `Found "${text}" after ${scroll + 1} scroll(s) ${direction}${onNote}`,
+        ...(selector
+          ? { selectorDiagnostics: selectorDiagnostics(selector, selectorMatches) }
+          : {}),
+      };
+    }
+  }
+
+  // Show what's on screen after exhausting all scrolls
+  let screenSummary = '';
+  try {
+    const elements = await getScreenElements(mcp);
+    const uniqueTexts = [...new Set(elements.map((el) => el.text).filter((t) => t.length > 0))];
+    screenSummary =
+      uniqueTexts.length > 0
+        ? `\n    Screen contains: ${uniqueTexts.join(' | ')}`
+        : '\n    Screen: (no text elements found)';
+  } catch {
+    /* ignore */
+  }
+
+  const failure = selector
+    ? `selector(${describeElementSelector(selector)}) not found after ${maxScrolls} scroll(s) ${direction}${onNote}`
+    : `"${text}" not found after ${maxScrolls} scroll(s) ${direction}${onNote}${screenSummary}`;
+  return {
+    success: false,
+    message: failure,
+    ...(selector
+      ? { selectorDiagnostics: selectorDiagnostics(selector, selectorMatches, [failure]) }
+      : {}),
+  };
+}
+
+/**
+ * Wait until a condition is met: element visible, element gone, or screen loaded (DOM stable).
+ * Polls every 500ms up to the given timeout.
+ */
+async function waitUntilCondition(
+  mcp: MCPClient,
+  condition: 'visible' | 'gone' | 'screenLoaded',
+  text: string | undefined,
+  timeoutSeconds: number,
+  poll: FlowTapPollOptions,
+  selector?: ElementSelector
+): Promise<ActionResult> {
+  const pollMs = 500;
+  const deadline = Date.now() + timeoutSeconds * 1000;
+
+  if (appclawDebug)
+    ui.printAgentBullet(
+      `[waitUntil] condition=${condition} text=${text ? `"${text}"` : 'n/a'} timeout=${timeoutSeconds}s`
+    );
+
+  if (condition === 'screenLoaded') {
+    // Wait until the screen has stabilized.
+    // In vision mode: compare screenshot sizes (no DOM call).
+    // In DOM mode: compare DOM lengths as a proxy for structural stability.
+    // Either way: if the size stays within 2% for 2 consecutive polls, the screen is loaded.
+    let prevLen = 0;
+    let stableCount = 0;
+    const stableThreshold = 2;
+    const visionMode = isVisionMode();
+    while (Date.now() < deadline) {
+      let len: number;
+      if (visionMode) {
+        const img = await screenshot(mcp);
+        len = img?.length ?? 0;
+      } else {
+        const pageSource = await getPageSource(mcp);
+        len = pageSource.length;
+      }
+      const delta = prevLen > 0 ? Math.abs(len - prevLen) / prevLen : 1;
+      if (prevLen > 0 && delta <= 0.02) {
+        stableCount++;
+        if (stableCount >= stableThreshold) {
+          return {
+            success: true,
+            message: `Screen loaded (stable after ${stableCount + 1} checks)`,
+          };
+        }
+      } else {
+        stableCount = 0;
+      }
+      prevLen = len;
+      await sleep(pollMs);
+    }
+    return { success: false, message: `Screen did not stabilize within ${timeoutSeconds}s` };
+  }
+
+  if (selector) {
+    let lastMatches: UIElement[] = [];
+    while (Date.now() < deadline) {
+      const elements = await getScreenElements(mcp);
+      const resolution = resolveElementSelector(elements, selector);
+      lastMatches = resolution.matches.filter((element) => element.visible !== false);
+      if (condition === 'visible' && lastMatches.length > 0) {
+        return {
+          success: true,
+          message: `selector(${describeElementSelector(selector)}) appeared on screen`,
+          selectorDiagnostics: selectorDiagnostics(selector, lastMatches),
+        };
+      }
+      if (condition === 'gone' && lastMatches.length === 0) {
+        return {
+          success: true,
+          message: `selector(${describeElementSelector(selector)}) is no longer on screen`,
+          selectorDiagnostics: selectorDiagnostics(selector, []),
+        };
+      }
+      await sleep(pollMs);
+    }
+    const failure =
+      condition === 'visible'
+        ? `selector(${describeElementSelector(selector)}) did not appear within ${timeoutSeconds}s`
+        : `selector(${describeElementSelector(selector)}) did not disappear within ${timeoutSeconds}s`;
+    return {
+      success: false,
+      message: failure,
+      selectorDiagnostics: selectorDiagnostics(selector, lastMatches, [failure]),
+    };
+  }
+
+  if (!text) {
+    return { success: false, message: `waitUntil "${condition}" requires a text/element target` };
+  }
+
+  const useVision = isVisionLocateEnabled();
+  const visionFirst = isVisionMode();
+
+  while (Date.now() < deadline) {
+    let found = false;
+
+    if (visionFirst) {
+      found = await visionAssert(mcp, text);
+    } else {
+      const elements = await getScreenElements(mcp);
+      found = domContainsText(elements, text);
+      if (!found && useVision) {
+        found = await visionAssert(mcp, text);
+      }
+    }
+
+    if (condition === 'visible' && found) {
+      return { success: true, message: `"${text}" appeared on screen` };
+    }
+    if (condition === 'gone' && !found) {
+      return { success: true, message: `"${text}" is no longer on screen` };
+    }
+
+    await sleep(pollMs);
+  }
+
+  if (condition === 'visible') {
+    return { success: false, message: `"${text}" did not appear within ${timeoutSeconds}s` };
+  }
+  return { success: false, message: `"${text}" did not disappear within ${timeoutSeconds}s` };
+}
+
+async function executeStepUnredacted(
+  mcp: MCPClient,
+  step: FlowStep,
+  meta: FlowMeta,
+  appResolver: AppResolver | undefined,
+  tapPoll: FlowTapPollOptions,
+  deviceUdid?: string,
+  scroll?: ScrollControl
+): Promise<ActionResult> {
+  // Vision mode: natural language steps (verbatim set) use visionExecute with the original
+  // instruction — same path as the step recorders — for precise context-aware element location.
+  // Explicit YAML steps (no verbatim) fall through to the normal DOM/vision-locate paths.
+  if (
+    isVisionMode() &&
+    step.verbatim &&
+    // Secret-bearing type steps stay on the focused-field + local keyboard path;
+    // never put resolved credentials into a vision instruction.
+    !step.sensitive &&
+    (step.kind === 'tap' || step.kind === 'type' || step.kind === 'assert')
+  ) {
+    const { visionExecute } = await import('./vision-execute.js');
+    // Implicit wait: re-capture the screen and re-locate until the element is
+    // found or the poll budget is exhausted. Mirrors tapByLabel's DOM polling so
+    // vision-mode actions also wait for not-yet-rendered elements (e.g. a screen
+    // that's still loading) instead of failing on the first single-shot attempt.
+    for (let attempt = 0; attempt < tapPoll.maxAttempts; attempt++) {
+      const vr = await visionExecute(mcp, step.verbatim, appResolver, deviceUdid);
+      // null = no vision API key, or needs executeStep — fall through to DOM path.
+      if (!vr || vr.result.message === '__needs_executeStep__') break;
+      // Found (or a get-info answer) → done. Get-info questions never retry.
+      if (vr.result.success || vr.isGetInfo) return vr.result;
+      // Not located yet — wait a beat and re-observe, unless the budget is spent.
+      if (attempt + 1 < tapPoll.maxAttempts) {
+        ui.printAgentBullet(
+          `auto-wait: "${step.verbatim}" not on screen yet — re-capturing screenshot ` +
+            `(attempt ${attempt + 2}/${tapPoll.maxAttempts}, every ${tapPoll.intervalMs}ms)`
+        );
+        await sleep(tapPoll.intervalMs);
+        continue;
+      }
+      ui.printAgentBullet(
+        `auto-wait: gave up on "${step.verbatim}" after ${tapPoll.maxAttempts} attempts ` +
+          `(~${Math.round((tapPoll.maxAttempts * tapPoll.intervalMs) / 1000)}s)`
+      );
+      return vr.result; // budget exhausted — return the last (failed) result
+    }
+  }
+
+  switch (step.kind) {
+    case 'launchApp': {
+      const id = meta.appId?.trim();
+      if (!id) {
+        return { success: false, message: 'launchApp requires appId in the YAML header' };
+      }
+      const r = await activateAppWithFallback(mcp, id);
+      if (r.success) {
+        const cacheCtx = getActiveLocatorCache();
+        if (cacheCtx) cacheCtx.currentAppId = id;
+      }
+      return { success: r.success, message: r.message };
+    }
+    case 'openApp': {
+      if (!appResolver) {
+        return {
+          success: false,
+          message: 'open … app steps need the installed-apps list (internal: pass AppResolver)',
+        };
+      }
+      let pkg = resolveAppId(step.query, appResolver);
+      if (!pkg) {
+        // The app list is cached at session start, so an app installed mid-session
+        // won't be found. Re-fetch the device list once and retry before failing.
+        if (await appResolver.refresh()) {
+          pkg = resolveAppId(step.query, appResolver);
+        }
+      }
+      if (!pkg) {
+        return {
+          success: false,
+          message: `Could not resolve app name "${step.query}" to a package (install it or add appId in YAML header + use launchApp)`,
+        };
+      }
+      const r = await activateAppWithFallback(mcp, pkg);
+      if (r.success) {
+        const cacheCtx = getActiveLocatorCache();
+        if (cacheCtx) cacheCtx.currentAppId = pkg;
+      }
+      return {
+        success: r.success,
+        message: r.success ? `Launched ${step.query} (${pkg})` : r.message,
+      };
+    }
+    case 'closeApp': {
+      // Resolve which app to terminate: an explicit name → package, otherwise the
+      // app launched this session (locator-cache currentAppId) or the YAML appId.
+      let pkg: string | null = null;
+      if (step.query) {
+        if (!appResolver) {
+          return {
+            success: false,
+            message: 'close <app> steps need the installed-apps list (internal: pass AppResolver)',
+          };
+        }
+        pkg = resolveAppId(step.query, appResolver);
+        if (!pkg && (await appResolver.refresh())) {
+          pkg = resolveAppId(step.query, appResolver);
+        }
+        if (!pkg) {
+          return {
+            success: false,
+            message: `Could not resolve app name "${step.query}" to a package`,
+          };
+        }
+      } else {
+        // No name: close the current foreground app. Read it from the live page
+        // source (its package), falling back to session state — so this works even
+        // when the locator cache isn't active (step recorder / SDK).
+        const pageSource = await getPageSource(mcp).catch(() => '');
+        pkg =
+          extractAppIdFromDom(pageSource) ??
+          getActiveLocatorCache()?.currentAppId ??
+          meta.appId?.trim() ??
+          null;
+        if (!pkg) {
+          return {
+            success: false,
+            message:
+              'close app: could not determine the current app — name it (e.g. "close youtube") or set appId in the YAML header',
+          };
+        }
+      }
+      const r = await terminateApp(mcp, pkg);
+      if (r.success) {
+        const cacheCtx = getActiveLocatorCache();
+        if (cacheCtx && cacheCtx.currentAppId === pkg) cacheCtx.currentAppId = undefined;
+      }
+      return {
+        success: r.success,
+        message: r.success ? `Closed ${step.query ?? pkg} (${pkg})` : r.message,
+      };
+    }
+    case 'wait':
+      await sleep(Math.round(step.seconds * 1000));
+      return { success: true, message: `Waited ${step.seconds}s` };
+    case 'waitUntil':
+      return waitUntilCondition(
+        mcp,
+        step.condition,
+        step.text,
+        step.timeoutSeconds,
+        tapPoll,
+        step.selector
+      );
+    case 'tap':
+      return step.selector
+        ? tapBySelector(mcp, step.selector, tapPoll)
+        : tapByLabel(mcp, step.label, tapPoll, step.proximity);
+    case 'doubleTap':
+      return step.selector
+        ? tapBySelector(mcp, step.selector, tapPoll, 'double_tap')
+        : tapByLabel(mcp, step.label, tapPoll, step.proximity, 'double_tap');
+    case 'longPress':
+      return step.selector
+        ? longPressBySelector(mcp, step.selector, tapPoll, step.duration)
+        : longPressByLabel(mcp, step.label, step.duration);
+    case 'type': {
+      return flowTypeText(
+        mcp,
+        step.text,
+        step.target,
+        deviceUdid,
+        tapPoll,
+        step.proximity,
+        step.selector,
+        step.sensitive
+      );
+    }
+    case 'enter':
+      return pressEnterKey(mcp);
+    case 'back':
+      await mcp.callTool('appium_mobile_press_key', { key: 'BACK' });
+      return { success: true, message: 'Back' };
+    case 'home':
+      await mcp.callTool('appium_mobile_press_key', { key: 'HOME' });
+      return { success: true, message: 'Home' };
+    case 'swipe': {
+      const dir = step.direction;
+      const count = scroll?.times ?? step.repeat ?? 1;
+      const gestureAction = dir === 'left' || dir === 'right' ? 'swipe' : 'scroll';
+
+      // Element-anchored swipe: when a target is named ("swipe the slider to the
+      // right"), start the gesture from that element's center. Falls back to a
+      // screen-center swipe if the element can't be located.
+      let anchorCoords: { x: number; y: number; endX: number; endY: number } | null = null;
+      let anchored = false;
+      if (step.selector) {
+        const resolved = await resolveStructuredActionTarget(mcp, step.selector, tapPoll);
+        if (!resolved.element) {
+          return {
+            success: false,
+            message: resolved.error ?? 'Structured swipe target did not resolve',
+            selectorDiagnostics: resolved.diagnostics,
+          };
+        }
+        const center = resolved.element.center;
+        anchorCoords = anchoredSwipeCoords(mcp, center, dir, scroll?.distance);
+        anchored = true;
+      } else if (step.target) {
+        const center = await resolveTargetCenter(mcp, step.target);
+        if (center) {
+          anchorCoords = anchoredSwipeCoords(mcp, center, dir, scroll?.distance);
+          anchored = true;
+        } else {
+          ui.printAgentBullet(
+            `"${step.target}" not found — swiping ${dir} from screen center instead`
+          );
+        }
+      }
+
+      // Distance control: appium-mcp ignores scrollDistance for plain scroll/swipe,
+      // so a custom distance is driven by explicit start/end coordinates instead.
+      const customCoords =
+        anchorCoords ??
+        (scroll?.distance ? scrollCoordsForDistance(mcp, dir, scroll.distance) : null);
+      let lastError = '';
+      for (let i = 0; i < count; i++) {
+        const result = await mcp.callTool('appium_gesture', {
+          action: gestureAction,
+          ...(customCoords ? customCoords : { direction: dir }),
+        });
+        const text =
+          result.content
+            ?.map((c: { type: string; text?: string }) => (c.type === 'text' ? c.text : ''))
+            .join('') ?? '';
+        const bad = text.toLowerCase().includes('error') || text.toLowerCase().includes('failed');
+        if (bad) {
+          lastError = text.slice(0, 200);
+          return { success: false, message: lastError };
+        }
+        if (i < count - 1) await sleep(300);
+      }
+      const distanceNote = scroll?.distance ? ` (${scroll.distance})` : '';
+      const onNote = anchored ? ` on "${step.target}"` : '';
+      return {
+        success: true,
+        message:
+          (count > 1 ? `Swiped ${dir} ${count} times` : `Swiped ${dir}`) + onNote + distanceNote,
+      };
+    }
+    case 'zoom': {
+      // Resolve optional target to coordinates/UUID for pinch_zoom.
+      // Vision mode: use df-vision to locate the element by description.
+      // DOM mode: parse page source and find element UUID.
+      let elementUUID: string | undefined;
+      if (step.selector) {
+        const resolved = await resolveStructuredActionTarget(mcp, step.selector, tapPoll);
+        if (!resolved.element) {
+          return {
+            success: false,
+            message: resolved.error ?? 'Structured zoom target did not resolve',
+            selectorDiagnostics: resolved.diagnostics,
+          };
+        }
+        const [x, y] = resolved.element.center;
+        const pinchResult = await mcp.callTool('appium_gesture', {
+          action: 'pinch_zoom',
+          scale: step.scale,
+          x,
+          y,
+        });
+        const pinchText =
+          pinchResult.content
+            ?.map((content: { type: string; text?: string }) =>
+              content.type === 'text' ? content.text : ''
+            )
+            .join('') ?? '';
+        const failed =
+          pinchText.toLowerCase().includes('failed') || pinchText.toLowerCase().includes('error');
+        return {
+          success: !failed,
+          message: failed
+            ? pinchText.slice(0, 200)
+            : `Zoomed ${step.scale >= 1 ? 'in' : 'out'} on selector(${describeElementSelector(step.selector)}) at [${x}, ${y}]`,
+          selectorDiagnostics: resolved.diagnostics,
+        };
+      }
+      if (step.target) {
+        try {
+          if (isVisionMode() || isVisionLocateEnabled()) {
+            // Vision path: locate element → get synthetic ai-element UUID with coordinates
+            const visionUuid = await findElementByVision(mcp, step.target);
+            if (visionUuid) elementUUID = visionUuid;
+          } else {
+            // DOM path: parse page source → find element UUID
+            const { findByIdStrategies: zoomFindById } = await import('../agent/element-finder.js');
+            const pageSource = await getPageSource(mcp);
+            const { detectPlatform: zoomDetectPlatform } = await import('../perception/screen.js');
+            const { parseAndroidPageSource: zoomParseAndroid } =
+              await import('../perception/android-parser.js');
+            const { parseIOSPageSource: zoomParseIOS } =
+              await import('../perception/ios-parser.js');
+            const platform = zoomDetectPlatform(pageSource);
+            const elements =
+              platform === 'android' ? zoomParseAndroid(pageSource) : zoomParseIOS(pageSource);
+            const scored = elements
+              .map((el) => ({ el, s: scoreTapMatch(el, step.target!) }))
+              .filter((x) => x.s >= 0)
+              .sort((a, b) => a.s - b.s);
+            const pick = scored[0]?.el;
+            if (pick) {
+              elementUUID =
+                (await zoomFindById(mcp, pick.accessibilityId || pick.id, pick.text)) ?? undefined;
+            }
+          }
+        } catch {
+          // Non-fatal: fall back to screen-center zoom
+        }
+      }
+
+      let pinchArgs: Record<string, unknown> = { action: 'pinch_zoom', scale: step.scale };
+      if (elementUUID) {
+        if (isAIElement(elementUUID)) {
+          // ai-element: UUIDs are not in Appium's cache — extract the center coordinates
+          // and pass them as x,y so the pinch is centered on the located element.
+          const coords = parseAIElementCoords(elementUUID);
+          if (coords) {
+            pinchArgs.x = coords.x;
+            pinchArgs.y = coords.y;
+          }
+        } else {
+          // Real Appium UUID: pass directly for element-bounds-based pinch.
+          pinchArgs.elementUUID = elementUUID;
+        }
+      }
+
+      const zoomResult = await mcp.callTool('appium_gesture', pinchArgs);
+      const zoomText =
+        zoomResult.content
+          ?.map((c: { type: string; text?: string }) => (c.type === 'text' ? c.text : ''))
+          .join('') ?? '';
+      const zoomFailed =
+        zoomText.toLowerCase().includes('failed') || zoomText.toLowerCase().includes('error');
+      if (zoomFailed) {
+        return { success: false, message: zoomText.slice(0, 200) };
+      }
+      const direction = step.scale >= 1 ? 'in' : 'out';
+      const targetDesc = step.target ? ` on "${step.target}"` : '';
+      return {
+        success: true,
+        message: `Zoomed ${direction} (scale=${step.scale})${targetDesc}`,
+      };
+    }
+    case 'drag': {
+      const dragApiKey = getStarkVisionApiKey();
+      const dragBaseUrl = getStarkVisionBaseUrl();
+      if (!dragApiKey && !dragBaseUrl) {
+        return {
+          success: false,
+          message: 'drag step requires vision (GEMINI_API_KEY or STARK_VISION_BASE_URL)',
+        };
+      }
+      const dragImage = await screenshot(mcp);
+      if (!dragImage) {
+        return { success: false, message: 'Failed to capture screenshot for drag' };
+      }
+      const { StarkVisionClient: DragClient, scaleCoordinates: scaleDragCoords } = (
+        await import('@appclaw/vision')
+      ).default;
+      const dragClient = new DragClient({
+        apiKey: dragApiKey || 'local',
+        model: getStarkVisionModel(),
+        disableThinking: true,
+        ...(dragBaseUrl && { baseUrl: dragBaseUrl }),
+        ...(dragBaseUrl && { coordinateOrder: getStarkVisionCoordinateOrder() }),
+      });
+      const dragScreenSize = await getScreenSizeForStark(mcp, dragImage);
+      const dragInstruction = `drag ${step.from} to ${step.to}`;
+      const rawDragResp = await dragClient.understandAndLocate(dragInstruction, dragImage);
+      const cleanedDragText = rawDragResp.trim().replace(/(^```json|```$)/g, '');
+      let dragActions: any[];
+      try {
+        const parsed = JSON.parse(cleanedDragText);
+        dragActions = Array.isArray(parsed) ? parsed : [parsed];
+      } catch {
+        return { success: false, message: 'Vision could not parse drag response' };
+      }
+      const dragAction = dragActions[0];
+      const fromLocatorFallback = dragAction?.locators?.[0];
+      const toLocatorFallback = dragAction?.locators?.[1];
+
+      // Source must be found and visible
+      if (!dragAction || dragAction.action !== 'drag' || !fromLocatorFallback?.coordinates) {
+        return {
+          success: false,
+          message: `"${step.from}" is not visible on screen`,
+        };
+      }
+      const fromCoords = fromLocatorFallback.coordinates as [number, number];
+      if (fromCoords[0] === 0 && fromCoords[1] === 0) {
+        return { success: false, message: `Drag failed: "${step.from}" is not visible on screen` };
+      }
+
+      // Destination: use locator coordinates if valid; otherwise infer direction from step.to / step.from
+      const rawToCoords = toLocatorFallback?.coordinates as [number, number] | undefined;
+      const hasValidTo =
+        rawToCoords && rawToCoords.length >= 2 && !(rawToCoords[0] === 0 && rawToCoords[1] === 0);
+
+      let toCoords: [number, number];
+      if (hasValidTo) {
+        toCoords = rawToCoords!;
+      } else {
+        // Infer direction from the destination description or overall instruction
+        // Stark coordinates are [y, x] in 0-1000 normalized space
+        const directionSource = `${step.to} ${step.from}`.toLowerCase();
+        const DRAG_OFFSET = 200;
+        let dy = 0,
+          dx = 0;
+        if (/\bright\b/.test(directionSource)) dx = DRAG_OFFSET;
+        else if (/\bleft\b/.test(directionSource)) dx = -DRAG_OFFSET;
+        else if (/\bdown\b/.test(directionSource)) dy = DRAG_OFFSET;
+        else if (/\bup\b/.test(directionSource)) dy = -DRAG_OFFSET;
+        else {
+          return { success: false, message: `"${step.to}" is not visible on screen` };
+        }
+        toCoords = [
+          Math.max(0, Math.min(1000, fromCoords[0] + dy)),
+          Math.max(0, Math.min(1000, fromCoords[1] + dx)),
+        ];
+      }
+
+      const fromBbox = scaleDragCoords(fromCoords, dragScreenSize);
+      const toBbox = scaleDragCoords(toCoords, dragScreenSize);
+      const dragResult = await mcp.callTool('appium_drag_and_drop', {
+        sourceX: Math.round(fromBbox.center.x),
+        sourceY: Math.round(fromBbox.center.y),
+        targetX: Math.round(toBbox.center.x),
+        targetY: Math.round(toBbox.center.y),
+        duration: step.duration ?? 600,
+        longPressDuration: step.longPressDuration ?? 400,
+      });
+      const dragText =
+        dragResult.content?.map((c: any) => (c.type === 'text' ? c.text : '')).join('') ?? '';
+      const dragSuccess =
+        !dragText.toLowerCase().includes('failed') && !dragText.toLowerCase().includes('error');
+      return {
+        success: dragSuccess,
+        message: dragSuccess
+          ? `Dragged "${step.from}" to "${step.to}"`
+          : `Drag failed: ${dragText.slice(0, 200)}`,
+      };
+    }
+    case 'assert':
+      return step.selector
+        ? assertStructuredSelector(mcp, step.selector, step.properties, step.count, tapPoll)
+        : assertTextVisible(mcp, step.text ?? '', tapPoll, !step.sensitive);
+    case 'scrollAssert':
+      return scrollUntilVisible(
+        mcp,
+        step.text,
+        step.direction,
+        scroll?.times ?? step.maxScrolls,
+        tapPoll,
+        scroll?.distance,
+        step.target,
+        step.targetProximity,
+        step.selector
+      );
+    case 'getInfo': {
+      const infoApiKey = getStarkVisionApiKey();
+      const infoBaseUrl = getStarkVisionBaseUrl();
+      if (!infoApiKey && !infoBaseUrl) {
+        return {
+          success: false,
+          message: 'getInfo requires vision (GEMINI_API_KEY or STARK_VISION_BASE_URL)',
+        };
+      }
+      const infoImage = await screenshot(mcp);
+      if (!infoImage) {
+        return { success: false, message: 'Failed to capture screenshot for getInfo' };
+      }
+      const { StarkVisionClient: InfoClient } = (await import('@appclaw/vision')).default;
+      const infoClient = new InfoClient({
+        apiKey: infoApiKey || 'local',
+        model: getStarkVisionModel(),
+        disableThinking: true,
+        ...(infoBaseUrl && { baseUrl: infoBaseUrl }),
+        ...(infoBaseUrl && { coordinateOrder: getStarkVisionCoordinateOrder() }),
+      });
+      const infoResponse = await infoClient.getElementInfo(infoImage, step.query, true);
+      try {
+        const infoParsed = JSON.parse(infoResponse.replace(/(^```json\s*|```\s*$)/g, '').trim());
+        const answer = infoParsed.answer || infoResponse;
+        return { success: true, message: answer };
+      } catch {
+        return { success: true, message: infoResponse };
+      }
+    }
+    case 'done': {
+      // When done has a message, treat it as an assertion — verify the claim
+      // is true on screen before declaring success. A bare `done` (no message)
+      // passes unconditionally.
+      if (step.message) {
+        const verification = await assertTextVisible(mcp, step.message, tapPoll);
+        if (!verification.success) {
+          return {
+            success: false,
+            message: `done assertion failed: "${step.message}" not verified on screen`,
+          };
+        }
+      }
+      return { success: true, message: step.message ?? 'done' };
+    }
+  }
+}
+
+/** Execute one step while ensuring resolved secrets cannot reach logs or reports. */
+export async function executeStep(
+  mcp: MCPClient,
+  step: FlowStep,
+  meta: FlowMeta,
+  appResolver: AppResolver | undefined,
+  tapPoll: FlowTapPollOptions,
+  deviceUdid?: string,
+  scroll?: ScrollControl
+): Promise<ActionResult> {
+  const result = await executeStepUnredacted(
+    mcp,
+    step,
+    meta,
+    appResolver,
+    tapPoll,
+    deviceUdid,
+    scroll
+  );
+  if (!step.sensitiveValues?.length) return result;
+  // Screenshot payloads are base64/binary-like and cannot contain the plain
+  // resolved value; keep them out of the recursive string-redaction pass.
+  const { beforeScreenshot, ...redactable } = result;
+  return {
+    ...redactSensitiveData(redactable, step.sensitiveValues),
+    ...(beforeScreenshot ? { beforeScreenshot } : {}),
+  };
+}
+
+/**
+ * Execute a single phase (setup / test / assertion) and return its result.
+ * Extracted for SRP: the runner orchestrates phases, this handles one.
+ */
+async function executePhase(
+  mcp: MCPClient,
+  phase: FlowPhase,
+  steps: FlowStep[],
+  meta: FlowMeta,
+  appResolver: AppResolver | undefined,
+  tapPoll: FlowTapPollOptions,
+  stepDelayMs: number,
+  globalStepOffset: number,
+  globalTotal: number,
+  onFlowStep: RunYamlFlowOptions['onFlowStep'],
+  artifactCollector?: RunArtifactCollector,
+  deviceUdid?: string
+): Promise<PhaseResult> {
+  const phaseLabels: Record<FlowPhase, string> = {
+    setup: 'Setup',
+    test: 'Test',
+    assertion: 'Assertions',
+  };
+
+  ui.printAgentBullet(`── ${phaseLabels[phase]} ──`);
+
+  let executed = 0;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const label = stepLabel(step);
+    const globalN = globalStepOffset + i + 1;
+
+    // Confirm interpolation in debug mode without ever printing resolved secrets.
+    if (appclawDebug && step.verbatim?.includes('***')) {
+      ui.printAgentBullet('[debug] secret placeholders resolved (values redacted)');
+    }
+
+    const globalIdx = globalStepOffset + i;
+    artifactCollector?.startStep(globalIdx);
+
+    // Capture "before" screenshot for interactive steps (tap, type, swipe)
+    // Skip in vision mode — visionExecute takes its own screenshot internally.
+    const isInteractive = step.kind === 'tap' || step.kind === 'type' || step.kind === 'swipe';
+    let beforeImg: string | null = null;
+    let beforeDims: { width: number; height: number } | undefined;
+    if (artifactCollector && isInteractive && !isVisionMode()) {
+      try {
+        beforeImg = await screenshot(mcp);
+        if (beforeImg) beforeDims = pngDimensionsFromBase64(beforeImg) ?? undefined;
+      } catch {
+        /* non-critical */
+      }
+    }
+
+    onFlowStep?.(globalN, globalTotal, step.kind, label, 'running');
+    resetVisionTokens();
+    const result = await executeStep(mcp, step, meta, appResolver, tapPoll, deviceUdid);
+    ui.printFlowStep(globalN, globalTotal, label, result.success);
+    const vt = getVisionTokens();
+    if (vt.totalTokens > 0) {
+      const vtPricing = MODEL_PRICING[getStarkVisionModel()] ?? [0, 0];
+      const vtCost =
+        (vt.inputTokens / 1_000_000) * vtPricing[0] + (vt.outputTokens / 1_000_000) * vtPricing[1];
+      ui.printStepTokens(
+        vt.inputTokens,
+        vt.outputTokens,
+        vt.cachedTokens || undefined,
+        vtCost,
+        'vision'
+      );
+    }
+    onFlowStep?.(
+      globalN,
+      globalTotal,
+      step.kind,
+      label,
+      result.success ? 'passed' : 'failed',
+      result.success ? undefined : result.message,
+      result.message
+    );
+
+    // Capture screenshot and record step for report artifacts
+    if (artifactCollector) {
+      const tapCoords = extractCoordinates(result.message);
+      // Add step first so attachScreenshot can find it
+      artifactCollector.addStep({
+        index: globalIdx,
+        kind: step.kind,
+        verbatim: step.verbatim,
+        target: label,
+        phase,
+        status: result.success ? 'passed' : 'failed',
+        error: result.success ? undefined : result.message,
+        message: result.message,
+        tapCoordinates: tapCoords,
+        deviceScreenSize: getCachedScreenSize(mcp) ?? undefined,
+        selectorDiagnostics: result.selectorDiagnostics,
+      });
+      // In vision mode, visionExecute already captured the pre-action screenshot.
+      // - Tap actions: attach as "before" so the tap dot overlay is rendered.
+      // - Other actions (type, assert, swipe): attach as "after" so the screenshot is shown.
+      // In DOM mode, use the explicit before screenshot + take an "after" screenshot.
+      const visionShot = lastVisionScreenshot;
+      if (visionShot) {
+        const dims = pngDimensionsFromBase64(visionShot) ?? undefined;
+        if (tapCoords) {
+          artifactCollector.attachBeforeScreenshot(globalIdx, visionShot, dims);
+        } else {
+          artifactCollector.attachScreenshot(globalIdx, visionShot, dims);
+        }
+      } else {
+        if (beforeImg) {
+          artifactCollector.attachBeforeScreenshot(globalIdx, beforeImg, beforeDims);
+        }
+        // Attach "after" screenshot (shows the result)
+        try {
+          const img = await screenshot(mcp);
+          if (img) {
+            const dims = pngDimensionsFromBase64(img) ?? undefined;
+            artifactCollector.attachScreenshot(globalIdx, img, dims);
+          }
+        } catch {
+          /* non-critical */
+        }
+      }
+    }
+
+    executed++;
+
+    if (!result.success) {
+      return {
+        phase,
+        success: false,
+        stepsExecuted: executed,
+        stepsTotal: steps.length,
+        failedAt: i + 1,
+        reason: result.message,
+      };
+    }
+
+    if (step.kind === 'done') break;
+    if (i < steps.length - 1) await sleep(stepDelayMs);
+  }
+
+  return {
+    phase,
+    success: true,
+    stepsExecuted: executed,
+    stepsTotal: steps.length,
+  };
+}
+
+export async function runYamlFlow(
+  mcp: MCPClient,
+  meta: FlowMeta,
+  inputSteps: FlowStep[],
+  options: RunYamlFlowOptions = {},
+  phases?: PhasedStep[]
+): Promise<RunYamlFlowResult> {
+  const stepDelayMs = options.stepDelayMs ?? 500;
+  const appResolver = options.appResolver;
+  const tapPoll: FlowTapPollOptions = {
+    maxAttempts: options.tapTargetMaxAttempts ?? DEFAULT_TAP_MAX_ATTEMPTS,
+    intervalMs: options.tapTargetPollIntervalMs ?? DEFAULT_TAP_POLL_MS,
+  };
+
+  const title = meta.name?.trim() || meta.appId || 'YAML flow';
+  const isPhased = phases && phases.some((p) => p.phase !== 'test');
+
+  // ── Phased execution (setup → steps → assertions) ──
+  if (isPhased && phases) {
+    const phaseOrder: FlowPhase[] = ['setup', 'test', 'assertion'];
+    const grouped = new Map<FlowPhase, FlowStep[]>();
+    for (const phase of phaseOrder) {
+      grouped.set(phase, []);
+    }
+    for (const ps of phases) {
+      grouped.get(ps.phase)!.push(ps.step);
+    }
+
+    // Auto-append done step to assertions (or test if no assertions)
+    const assertionSteps = grouped.get('assertion')!;
+    const testSteps = grouped.get('test')!;
+    const lastPhaseSteps = assertionSteps.length > 0 ? assertionSteps : testSteps;
+    const lastStep = lastPhaseSteps[lastPhaseSteps.length - 1];
+    if (!lastStep || lastStep.kind !== 'done') {
+      lastPhaseSteps.push({ kind: 'done' });
+    }
+
+    const totalSteps = phaseOrder.reduce((sum, p) => sum + (grouped.get(p)?.length ?? 0), 0);
+    ui.printReplayGoal(title, totalSteps);
+    if (meta.description) {
+      ui.printAgentBullet(meta.description);
+    }
+
+    const phaseResults: PhaseResult[] = [];
+    let globalOffset = 0;
+    let totalExecuted = 0;
+
+    for (const phase of phaseOrder) {
+      const steps = grouped.get(phase)!;
+      if (steps.length === 0) continue;
+
+      const result = await executePhase(
+        mcp,
+        phase,
+        steps,
+        meta,
+        appResolver,
+        tapPoll,
+        stepDelayMs,
+        globalOffset,
+        totalSteps,
+        options.onFlowStep,
+        options.artifactCollector,
+        options.deviceUdid
+      );
+      phaseResults.push(result);
+      totalExecuted += result.stepsExecuted;
+      globalOffset += steps.length;
+
+      if (!result.success) {
+        ui.printReplayResult(totalExecuted - 1, totalSteps, 0);
+        ui.printError(
+          `Flow stopped during ${phase} phase at step ${result.failedAt}`,
+          result.reason
+        );
+        return {
+          success: false,
+          stepsExecuted: totalExecuted,
+          stepsTotal: totalSteps,
+          failedAt: globalOffset - steps.length + (result.failedAt ?? 0),
+          reason: result.reason,
+          phaseResults,
+          failedPhase: phase,
+        };
+      }
+    }
+
+    ui.printReplayResult(totalExecuted, totalSteps, 0);
+    return {
+      success: true,
+      stepsExecuted: totalExecuted,
+      stepsTotal: totalSteps,
+      phaseResults,
+    };
+  }
+
+  // ── Flat execution (legacy — all steps treated as "test") ──
+  let steps = inputSteps;
+  const lastStep = steps[steps.length - 1];
+  if (!lastStep || lastStep.kind !== 'done') {
+    steps = [...steps, { kind: 'done' }];
+  }
+
+  const total = steps.length;
+  ui.printReplayGoal(title, total);
+
+  let executed = 0;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const label = stepLabel(step);
+    const n = i + 1;
+
+    if (appclawDebug && step.verbatim?.includes('***')) {
+      ui.printAgentBullet('[debug] secret placeholders resolved (values redacted)');
+    }
+
+    options.artifactCollector?.startStep(i);
+
+    // Capture "before" screenshot for interactive steps (tap, type, swipe)
+    // Skip in vision mode — visionExecute takes its own screenshot internally.
+    const isInteractiveFlat = step.kind === 'tap' || step.kind === 'type' || step.kind === 'swipe';
+    let beforeImgFlat: string | null = null;
+    let beforeDimsFlat: { width: number; height: number } | undefined;
+    if (options.artifactCollector && isInteractiveFlat && !isVisionMode()) {
+      try {
+        beforeImgFlat = await screenshot(mcp);
+        if (beforeImgFlat) beforeDimsFlat = pngDimensionsFromBase64(beforeImgFlat) ?? undefined;
+      } catch {
+        /* non-critical */
+      }
+    }
+
+    options.onFlowStep?.(n, total, step.kind, stepLabel(step), 'running');
+    resetVisionTokens();
+    const result = await executeStep(mcp, step, meta, appResolver, tapPoll, options.deviceUdid);
+    ui.printFlowStep(n, total, label, result.success);
+    const vt = getVisionTokens();
+    if (vt.totalTokens > 0) {
+      const vtPricing = MODEL_PRICING[getStarkVisionModel()] ?? [0, 0];
+      const vtCost =
+        (vt.inputTokens / 1_000_000) * vtPricing[0] + (vt.outputTokens / 1_000_000) * vtPricing[1];
+      ui.printStepTokens(
+        vt.inputTokens,
+        vt.outputTokens,
+        vt.cachedTokens || undefined,
+        vtCost,
+        'vision'
+      );
+    }
+    options.onFlowStep?.(
+      n,
+      total,
+      step.kind,
+      stepLabel(step),
+      result.success ? 'passed' : 'failed',
+      result.success ? undefined : result.message,
+      result.message
+    );
+
+    // Capture screenshot and record step for report artifacts
+    if (options.artifactCollector) {
+      const tapCoords = extractCoordinates(result.message);
+      // Add step first so attachScreenshot can find it
+      options.artifactCollector.addStep({
+        index: i,
+        kind: step.kind,
+        verbatim: step.verbatim,
+        target: label,
+        phase: 'test',
+        status: result.success ? 'passed' : 'failed',
+        error: result.success ? undefined : result.message,
+        message: result.message,
+        tapCoordinates: tapCoords,
+        deviceScreenSize: getCachedScreenSize(mcp) ?? undefined,
+        selectorDiagnostics: result.selectorDiagnostics,
+      });
+      // In vision mode, visionExecute already captured the pre-action screenshot.
+      // - Tap actions: attach as "before" so the tap dot overlay is rendered.
+      // - Other actions (type, assert, swipe): attach as "after" so the screenshot is shown.
+      // In DOM mode, use the explicit before screenshot + take an "after" screenshot.
+      const visionShotFlat = lastVisionScreenshot;
+      if (visionShotFlat) {
+        const dims = pngDimensionsFromBase64(visionShotFlat) ?? undefined;
+        if (tapCoords) {
+          options.artifactCollector.attachBeforeScreenshot(i, visionShotFlat, dims);
+        } else {
+          options.artifactCollector.attachScreenshot(i, visionShotFlat, dims);
+        }
+      } else {
+        if (beforeImgFlat) {
+          options.artifactCollector.attachBeforeScreenshot(i, beforeImgFlat, beforeDimsFlat);
+        }
+        // Attach "after" screenshot (shows the result)
+        try {
+          const img = await screenshot(mcp);
+          if (img) {
+            const dims = pngDimensionsFromBase64(img) ?? undefined;
+            options.artifactCollector.attachScreenshot(i, img, dims);
+          }
+        } catch {
+          /* non-critical */
+        }
+      }
+    }
+
+    executed++;
+
+    if (!result.success) {
+      ui.printReplayResult(executed - 1, total, 0);
+      ui.printError(`Flow stopped at step ${n}`, result.message);
+      return {
+        success: false,
+        stepsExecuted: executed,
+        stepsTotal: total,
+        failedAt: n,
+        reason: result.message,
+      };
+    }
+
+    if (step.kind === 'done') {
+      ui.printReplayResult(executed, total, 0);
+      return {
+        success: true,
+        stepsExecuted: executed,
+        stepsTotal: total,
+        reason: step.message,
+      };
+    }
+
+    await sleep(stepDelayMs);
+  }
+
+  ui.printReplayResult(executed, total, 0);
+  return {
+    success: true,
+    stepsExecuted: executed,
+    stepsTotal: total,
+  };
+}

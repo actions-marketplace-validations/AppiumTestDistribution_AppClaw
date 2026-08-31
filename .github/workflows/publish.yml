@@ -11,6 +11,12 @@ permissions:
   pull-requests: write
   id-token: write
 
+# Serialize release runs so two quick pushes can't race to push the
+# `chore(release) [skip ci]` commit back to main.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     name: Semantic Release
@@ -26,12 +32,18 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
+      # Install the whole workspace (root + every packages/*) from the lockfile.
       - name: Install dependencies
-        run: npm install --no-package-lock
+        run: npm ci
 
+      # Build all packages in dependency order (core -> cli -> runner -> agent)
+      # via the root build script so every dist/ is ready to publish.
       - name: Build
         run: npm run build
 
+      # Single release process → one version, one tag, one push to main for
+      # ALL @appclaw/* packages, published together via `npm publish --workspaces`
+      # in the @semantic-release/exec plugin. No second job, no race.
       - name: Semantic Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,531 @@
+/**
+ * Parse a single natural-language flow line into a FlowStep (verbatim preserved for display).
+ * Returns null if the line does not match any supported pattern — caller may error or fall through.
+ */
+
+import type { FlowStep, Proximity, ProximityRelation } from './types.js';
+
+function trimPunct(s: string): string {
+  return s.replace(/[.!?]+$/g, '').trim();
+}
+
+// UI elements a bare "close the X" usually dismisses — not an app-close. Keeps
+// "close the dialog" out of the closeApp path (terminate/quit/kill bypass this).
+const NON_APP_CLOSE_TARGETS =
+  /^(?:dialog|popup|pop-?up|modal|menu|drawer|keyboard|notifications?|banner|sheet|bottom\s*sheet|tab|window|panel|alert|toast|overlay|ad|ads|popup\s*ad)$/i;
+
+/** Natural-language relation phrase → ProximityRelation. Order-insensitive (lowercased, single-spaced). */
+const PROXIMITY_RELATIONS: Record<string, ProximityRelation> = {
+  above: 'above',
+  over: 'above',
+  below: 'below',
+  under: 'below',
+  underneath: 'below',
+  'left of': 'toLeftOf',
+  'to the left of': 'toLeftOf',
+  'to the left to': 'toLeftOf', // common preposition slip for "of"
+  'right of': 'toRightOf',
+  'to the right of': 'toRightOf',
+  'to the right to': 'toRightOf', // common preposition slip for "of"
+  near: 'near',
+  beside: 'near',
+  'next to': 'near',
+  within: 'within',
+  inside: 'within',
+  'inside of': 'within',
+};
+
+// Alternation of relation phrases, longest-first so "to the left of" wins over "left of".
+const RELATION_ALT = Object.keys(PROXIMITY_RELATIONS)
+  .sort((a, b) => b.length - a.length)
+  .map((p) => p.replace(/\s+/g, '\\s+'))
+  .join('|');
+const PROXIMITY_RE = new RegExp(`^(.+?)\\s+(${RELATION_ALT})\\s+(?:the\\s+)?(.+)$`, 'i');
+
+/**
+ * Split a "<target> <relation> <anchor>" phrase into the bare target label plus a
+ * Proximity qualifier. e.g. "login button below password field" →
+ * { label: "login button", proximity: { relation: 'below', anchor: 'password field' } }.
+ * Returns just the label unchanged when no relation phrase is present.
+ *
+ * The anchor phrase may itself carry a chained qualifier picking WHICH anchor:
+ * "YESBANK to the left of NSEFO which is near ₹0.04" (or without the "which is"
+ * connector) nests as proximity.anchorProximity.
+ */
+export function splitProximity(label: string): { label: string; proximity?: Proximity } {
+  const m = label.match(PROXIMITY_RE);
+  if (!m) return { label };
+  // A trailing connector on the target means the relation opens a qualifier
+  // clause: "YESBANK which is to the left of BSE" → target "YESBANK".
+  // Strip trailing connector filler: "which is" / "that is [located]" always;
+  // a BARE participle only after a generic region noun ("the area located
+  // above X" → "area"). A bare participle after a real label is kept —
+  // "Order Placed below Filters" must NOT become "Order".
+  const target = trimPunct(m[1].trim())
+    .replace(/\s+(?:which|that)\s+is(?:\s+(?:located|positioned|placed|situated))?$/i, '')
+    .replace(
+      /^((?:the\s+)?(?:area|section|carousel|strip|list|row|region|scroll\s*(?:area|view|section)))\s+(?:located|positioned|placed|situated)$/i,
+      '$1'
+    );
+  const relWord = m[2].toLowerCase().replace(/\s+/g, ' ');
+  const anchorRest = trimPunct(m[3].trim());
+  const relation = PROXIMITY_RELATIONS[relWord];
+  if (!relation || !target || !anchorRest) return { label };
+  // Recurse on the anchor phrase (dropping an optional "which is"/"that is"
+  // connector) so a qualified anchor nests instead of being matched literally.
+  const nested = splitProximity(
+    anchorRest.replace(/\s+(?:which|that)\s+is\s+(?:located\s+|positioned\s+|placed\s+)?/i, ' ')
+  );
+  if (nested.proximity && nested.label) {
+    return {
+      label: target,
+      proximity: { relation, anchor: nested.label, anchorProximity: nested.proximity },
+    };
+  }
+  return { label: target, proximity: { relation, anchor: anchorRest } };
+}
+
+/** Build a tap step, peeling off any trailing proximity qualifier. */
+function tapStep(label: string, verbatim: string): FlowStep {
+  const { label: bare, proximity } = splitProximity(label);
+  return { kind: 'tap', label: bare, ...(proximity ? { proximity } : {}), verbatim };
+}
+
+/** Build a type step, peeling off any trailing proximity qualifier from the target field. */
+function typeStep(text: string, rawTarget: string | undefined, verbatim: string): FlowStep {
+  if (!rawTarget) return { kind: 'type', text, verbatim };
+  const { label, proximity } = splitProximity(rawTarget);
+  return {
+    kind: 'type',
+    text,
+    target: label || undefined,
+    ...(proximity ? { proximity } : {}),
+    verbatim,
+  };
+}
+
+/** Strip common natural-language prefixes like "the text", "text", "element" from captured text. */
+function stripTextPrefix(s: string): string {
+  return s.replace(/^(?:the\s+)?(?:text|element|label)\s+/i, '').trim();
+}
+
+/**
+ * Try to interpret a human-readable instruction as a flow step.
+ */
+export function tryParseNaturalFlowLine(line: string): FlowStep | null {
+  const t = line.trim();
+  if (!t) return null;
+  const verbatim = t;
+
+  const openMatch = t.match(
+    /^(?:open|launch|start|go\s+to)\s+(?:the\s+)?(.+?)(?:\s+(?:app|application))?$/i
+  );
+  if (openMatch) {
+    const query = trimPunct(openMatch[1].trim());
+    if (query) return { kind: 'openApp', query, verbatim };
+  }
+
+  // "close/terminate/quit/kill [the] [<name>] [app]" → closeApp.
+  //   - bare ("close app" / "close the app" / "terminate the app") closes the current app
+  //   - named ("close youtube", "close the youtube app", "quit settings") closes that app
+  // For the `close` verb, a bare UI-element noun ("close the dialog", "close keyboard")
+  // is NOT an app-close — those stay null so they fall through to the tap/LLM path.
+  // terminate/quit/kill are unambiguous about app lifecycle, so they skip that guard.
+  const closeAppMatch = t.match(
+    /^(close|terminate|quit|kill)(?:\s+the)?\s+(.+?)(?:\s+(?:app|application))?$/i
+  );
+  if (closeAppMatch) {
+    const verb = closeAppMatch[1].toLowerCase();
+    let query: string | undefined = trimPunct(closeAppMatch[2].trim());
+    if (/^(?:app|application)$/i.test(query)) query = undefined; // "close the app" → current app
+    if (query && verb === 'close' && NON_APP_CLOSE_TARGETS.test(query)) {
+      // "close the dialog/keyboard/menu…" — a UI dismissal, not an app close.
+    } else {
+      return { kind: 'closeApp', ...(query ? { query } : {}), verbatim };
+    }
+  }
+
+  // "navigate to X" / "go to X screen" — tap-style navigation
+  const navigateMatch = t.match(
+    /^navigate\s+to\s+(?:the\s+)?(.+?)(?:\s+(?:screen|page|tab|section|view))?$/i
+  );
+  if (navigateMatch) {
+    const label = trimPunct(navigateMatch[1].trim());
+    if (label) return { kind: 'tap', label, verbatim };
+  }
+
+  // "long press X" / "long-press X" / "long tap X" / "press and hold X"
+  const longPressMatch = t.match(
+    /^(?:long[\s-]press|long[\s-]tap|press\s+and\s+hold)(?:\s+on)?\s+(?:the\s+)?(.+?)(?:\s+for\s+(\d+(?:\.\d+)?)\s*(?:ms|milliseconds?|s|seconds?))?$/i
+  );
+  if (longPressMatch) {
+    const label = trimPunct(longPressMatch[1].trim());
+    const durRaw = longPressMatch[2];
+    const durUnit =
+      longPressMatch[0].match(/(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)$/i)?.[2] ?? 'ms';
+    const duration = durRaw
+      ? durUnit.startsWith('s')
+        ? Math.round(Number(durRaw) * 1000)
+        : Math.round(Number(durRaw))
+      : undefined;
+    if (label)
+      return { kind: 'longPress', label, ...(duration != null ? { duration } : {}), verbatim };
+  }
+
+  // "double tap X" / "double-tap X" / "double click [on] X" — must run before
+  // the single-tap match so the "double" prefix isn't swallowed into the label.
+  const doubleTapMatch = t.match(/^double[\s-](?:tap|click|press)(?:\s+on)?\s+(?:the\s+)?(.+)$/i);
+  if (doubleTapMatch) {
+    const label = trimPunct(doubleTapMatch[1].trim());
+    if (label) {
+      const { label: bare, proximity } = splitProximity(label);
+      return { kind: 'doubleTap', label: bare, ...(proximity ? { proximity } : {}), verbatim };
+    }
+  }
+
+  const clickMatch = t.match(/^(?:click|tap|select|choose|pick)(?:\s+on)?\s+(?:the\s+)?(.+)$/i);
+  if (clickMatch) {
+    const label = trimPunct(clickMatch[1].trim());
+    if (label) return tapStep(label, verbatim);
+  }
+
+  const pressMatch = t.match(/^press(?:\s+on)?\s+(?:the\s+)?(.+)$/i);
+  if (pressMatch) {
+    const label = trimPunct(pressMatch[1].trim());
+    if (label) return tapStep(label, verbatim);
+  }
+
+  const typeMatch = t.match(/^(?:type|enter\s+text|input)\s+["'](.+)["']$/i);
+  if (typeMatch) {
+    return { kind: 'type', text: typeMatch[1], verbatim };
+  }
+  // "Type "X" in/into <target>" / "Enter 'X' in <target>" — quoted text + any target
+  const typeQuotedInMatch = t.match(
+    /^(?:type|enter|input)\s+["'](.+?)["']\s+(?:in|into)\s+(?:the\s+)?(.+)$/i
+  );
+  if (typeQuotedInMatch) {
+    const text = typeQuotedInMatch[1].trim();
+    const target = trimPunct(typeQuotedInMatch[2].trim());
+    if (text) return typeStep(text, target, verbatim);
+  }
+  // "Enter X in Y" / "Type X in Y" — unquoted text + target
+  // Use greedy (.+) with \s+(?:in|into) so the last "in/into" wins.
+  const typeInMatch = t.match(/^(?:type|enter|input)\s+(.+)\s+(?:in|into)\s+(?:the\s+)?(.+)$/i);
+  if (typeInMatch) {
+    const text = trimPunct(typeInMatch[1].trim());
+    const target = trimPunct(typeInMatch[2].trim());
+    if (text) return typeStep(text, target, verbatim);
+  }
+  // "Type the <field> as <value>" / "set the <field> to <value>" / "fill the <field> with <value>"
+  // — FIELD-first ordering, the inverse of "enter <value> in <field>" above. The leading
+  // "the" is required as the disambiguator so literal text containing "as"/"to"/"with"
+  // (e.g. `type save as draft`) still falls through to the bare-text rule below.
+  const typeFieldAssignMatch = t.match(
+    /^(?:type|enter|input|fill|set)\s+the\s+(.+?)\s+(?:as|to|with)\s+["']?(.+?)["']?$/i
+  );
+  if (typeFieldAssignMatch) {
+    const target = trimPunct(typeFieldAssignMatch[1].trim());
+    const text = trimPunct(typeFieldAssignMatch[2].trim());
+    if (text) return typeStep(text, target, verbatim);
+  }
+  const typeBare = t.match(/^(?:type|input)\s+(.+)$/i);
+  if (typeBare && !t.match(/^type\s*:/i)) {
+    const text = trimPunct(typeBare[1].trim());
+    if (text) return { kind: 'type', text, verbatim };
+  }
+
+  // "search for X" / "search X" / "look for X" / "find X" — type the query text
+  const searchForMatch = t.match(/^(?:search|look|find)\s+(?:for\s+)?["']?(.+?)["']?$/i);
+  if (searchForMatch && !t.match(/^(?:search|find)$/i)) {
+    let text = trimPunct(searchForMatch[1].trim());
+    // Check for "in <target>" destination
+    const searchInMatch = text.match(/^(.+)\s+(?:in|into)\s+(?:the\s+)?(.+)$/i);
+    if (searchInMatch) {
+      const target = trimPunct(searchInMatch[2].trim());
+      text = trimPunct(searchInMatch[1].trim());
+      if (text) return typeStep(text, target, verbatim);
+    }
+    if (text) return { kind: 'type', text, verbatim };
+  }
+
+  // "enter X" (bare, not "enter text X") — type the text
+  const enterTextBare = t.match(/^enter\s+(?!text\b)["']?(.+?)["']?$/i);
+  if (enterTextBare && !t.match(/^enter$/i)) {
+    let text = trimPunct(enterTextBare[1].trim());
+    const enterInMatch = text.match(/^(.+)\s+(?:in|into)\s+(?:the\s+)?(.+)$/i);
+    if (enterInMatch) {
+      const target = trimPunct(enterInMatch[2].trim());
+      text = trimPunct(enterInMatch[1].trim());
+      if (text) return typeStep(text, target, verbatim);
+    }
+    if (text) return { kind: 'type', text, verbatim };
+  }
+
+  // scroll down until "X" is visible / scroll down 3 times to find "X"
+  // Anchored form: "swipe the FII/DII left until Goal calculator is visible" —
+  // the optional element between the verb and the direction anchors the gesture
+  // inside that element's container (a carousel/strip) instead of screen center.
+  // MUST come before the simple swipe/scroll match to avoid premature matching
+  const scrollAssertMatch = t.match(
+    /^(?:scroll|swipe)\s+(?:(?:the\s+)?(.+?)\s+)?(up|down|left|right)\s+(?:(\d+)\s+times?\s+)?(?:until|to\s+(?:find|see|check|verify))\s+["']?(.+?)["']?\s*(?:is\s+(?:visible|present|shown|displayed|seen|found|there))?$/i
+  );
+  if (scrollAssertMatch) {
+    const rawTarget = scrollAssertMatch[1] ? trimPunct(scrollAssertMatch[1].trim()) : undefined;
+    const direction = scrollAssertMatch[2].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const maxScrolls = scrollAssertMatch[3] ? Number(scrollAssertMatch[3]) : 3;
+    const text = stripTextPrefix(trimPunct(scrollAssertMatch[4].trim()));
+    // The anchor may itself carry a spatial qualifier picking WHICH scroll area:
+    // "swipe the FII/DII below Post-Market Insights left until … is visible".
+    const split: { label?: string; proximity?: Proximity } = rawTarget
+      ? splitProximity(rawTarget)
+      : {};
+    if (text)
+      return {
+        kind: 'scrollAssert',
+        text,
+        direction,
+        maxScrolls,
+        ...(split.label ? { target: split.label } : {}),
+        ...(split.proximity ? { targetProximity: split.proximity } : {}),
+        verbatim,
+      };
+  }
+
+  // Direction-first anchored form: "swipe left inside the area above View All
+  // until Goal calculator is visible". The region phrase may be a real element
+  // label or a spatial phrase whose noun is generic ("area", "section") — the
+  // executor then swipes from the nearest element on that side of the anchor.
+  const insideScrollAssertMatch = t.match(
+    /^(?:scroll|swipe)\s+(up|down|left|right)\s+(?:(\d+)\s+times?\s+)?(?:inside|within|in|on)\s+(?:the\s+)?(.+?)\s+(?:until|to\s+(?:find|see|check|verify))\s+["']?(.+?)["']?\s*(?:is\s+(?:visible|present|shown|displayed|seen|found|there))?$/i
+  );
+  if (insideScrollAssertMatch) {
+    const direction = insideScrollAssertMatch[1].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const maxScrolls = insideScrollAssertMatch[2] ? Number(insideScrollAssertMatch[2]) : 3;
+    const region = trimPunct(insideScrollAssertMatch[3].trim());
+    const text = stripTextPrefix(trimPunct(insideScrollAssertMatch[4].trim()));
+    const split = splitProximity(region);
+    if (text)
+      return {
+        kind: 'scrollAssert',
+        text,
+        direction,
+        maxScrolls,
+        ...(split.label ? { target: split.label } : {}),
+        ...(split.proximity ? { targetProximity: split.proximity } : {}),
+        verbatim,
+      };
+  }
+
+  // "drag X to Y" / "slide X to Y" / "move X to Y"
+  const dragMatch = t.match(/^(?:drag|slide|move)\s+(.+?)\s+(?:to|until|towards?)\s+(.+)$/i);
+  if (dragMatch) {
+    const from = trimPunct(dragMatch[1].trim());
+    const to = trimPunct(dragMatch[2].trim());
+    if (from && to) return { kind: 'drag', from, to, verbatim };
+  }
+
+  // Plain directional swipe — "swipe right", "swipe to the right", "swipe up 3 times"
+  const swipeMatch = t.match(
+    /^swipe\s+(?:to\s+(?:the\s+)?)?(up|down|left|right)(?:\s+(\d+)\s*(?:times?))?$/i
+  );
+  if (swipeMatch) {
+    const direction = swipeMatch[1].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const repeat = swipeMatch[2] ? parseInt(swipeMatch[2], 10) : undefined;
+    return { kind: 'swipe', direction, ...(repeat && repeat > 1 ? { repeat } : {}), verbatim };
+  }
+
+  // Element-anchored swipe — "swipe the slider to the right", "swipe X left".
+  // Starts the gesture from the named element instead of the screen center.
+  // Runs AFTER the plain swipe so "swipe right" / "swipe to the right" stay plain.
+  const anchoredSwipeMatch = t.match(
+    /^swipe\s+(?:the\s+)?(.+?)\s+(?:to(?:wards)?\s+(?:the\s+)?)?(up|down|left|right)(?:\s+(\d+)\s*(?:times?))?$/i
+  );
+  if (anchoredSwipeMatch) {
+    const target = trimPunct(stripTextPrefix(anchoredSwipeMatch[1].trim()));
+    const direction = anchoredSwipeMatch[2].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const repeat = anchoredSwipeMatch[3] ? parseInt(anchoredSwipeMatch[3], 10) : undefined;
+    // Guard against the target being pure filler ("to", "the") that slipped past.
+    if (target && !/^(?:to|the|towards?)$/i.test(target)) {
+      return {
+        kind: 'swipe',
+        direction,
+        target,
+        ...(repeat && repeat > 1 ? { repeat } : {}),
+        verbatim,
+      };
+    }
+  }
+
+  const scrollMatch = t.match(/^scroll\s+(up|down|left|right)(?:\s+(\d+)\s*(?:times?))?/i);
+  if (scrollMatch) {
+    const direction = scrollMatch[1].toLowerCase() as 'up' | 'down' | 'left' | 'right';
+    const repeat = scrollMatch[2] ? parseInt(scrollMatch[2], 10) : undefined;
+    return { kind: 'swipe', direction, ...(repeat && repeat > 1 ? { repeat } : {}), verbatim };
+  }
+
+  // "zoom in [on X]" / "zoom out [on X]" / "pinch in [on X]" / "pinch out [on X]"
+  // "zoom in 2x [on X]" / "zoom out 50% [on X]" / "zoom in the map" (no "on/into")
+  const zoomMatch = t.match(
+    /^(?:zoom|pinch)\s+(in|out)(?:\s+(\d+(?:\.\d+)?)\s*(?:x|times?|%)?)?(?:\s+(?:(?:on|into)\s+)?(?:the\s+)?(.+))?$/i
+  );
+  if (zoomMatch) {
+    const direction = zoomMatch[1].toLowerCase();
+    const rawFactor = zoomMatch[2] ? Number(zoomMatch[2]) : undefined;
+    const target = zoomMatch[3] ? trimPunct(zoomMatch[3].trim()) : undefined;
+    // Determine scale: zoom in > 1, zoom out < 1
+    let scale: number;
+    if (rawFactor !== undefined) {
+      const isPercent = zoomMatch[0].match(/\d+\s*%/);
+      if (isPercent) {
+        // "zoom out 50%" → scale = 0.5, "zoom in 200%" → scale = 2.0
+        scale = direction === 'out' ? rawFactor / 100 : rawFactor / 100;
+      } else {
+        // "zoom in 2x" → scale = 2.0, "zoom out 2x" → scale = 0.5
+        scale = direction === 'out' ? 1 / rawFactor : rawFactor;
+      }
+    } else {
+      scale = direction === 'out' ? 0.5 : 2.0;
+    }
+    return { kind: 'zoom', scale, ...(target ? { target } : {}), verbatim };
+  }
+  // ── waitUntil: "wait until screen is loaded", "wait until <text> is visible/gone" ──
+  // Also: "wait 5s until ..." / "wait 10 seconds until ..."
+
+  // "wait until screen is loaded/stable/ready" (with optional timeout)
+  const waitScreenMatch = t.match(
+    /^wait\s+(?:(\d+)\s*(?:s|sec|seconds?)?\s+)?(?:until|for|till)\s+(?:the\s+)?screen\s+(?:is\s+)?(?:loaded|stable|ready|settled|idle)$/i
+  );
+  if (waitScreenMatch) {
+    const timeout = waitScreenMatch[1] ? Number(waitScreenMatch[1]) : 10;
+    return { kind: 'waitUntil', condition: 'screenLoaded', timeoutSeconds: timeout, verbatim };
+  }
+  // Also match trailing timeout: "wait until screen is loaded 15s"
+  const waitScreenMatch2 = t.match(
+    /^wait\s+(?:until|for|till)\s+(?:the\s+)?screen\s+(?:is\s+)?(?:loaded|stable|ready|settled|idle)\s+(\d+)\s*(?:s|sec|seconds?)?$/i
+  );
+  if (waitScreenMatch2) {
+    const timeout = Number(waitScreenMatch2[1]);
+    return { kind: 'waitUntil', condition: 'screenLoaded', timeoutSeconds: timeout, verbatim };
+  }
+
+  // "wait [Ns] until <text> is visible/present/shown" OR "wait until <text> is visible [Ns]"
+  // Also: "wait for <text> to be visible"
+  const waitVisibleMatch = t.match(
+    /^wait\s+(?:(\d+)\s*(?:s|sec|seconds?)?\s+)?(?:until|for|till)\s+["']?(.+?)["']?\s+(?:(?:is|to\s+be)\s+)?(?:visible|present|shown|displayed|appears?|exists?|loaded)(?:\s+(\d+)\s*(?:s|sec|seconds?)?)?$/i
+  );
+  if (waitVisibleMatch) {
+    const text = stripTextPrefix(trimPunct(waitVisibleMatch[2].trim()));
+    const timeout = waitVisibleMatch[1]
+      ? Number(waitVisibleMatch[1])
+      : waitVisibleMatch[3]
+        ? Number(waitVisibleMatch[3])
+        : 10;
+    if (text)
+      return { kind: 'waitUntil', condition: 'visible', text, timeoutSeconds: timeout, verbatim };
+  }
+
+  // "wait [Ns] until <text> is gone/hidden/invisible/disappears" OR trailing timeout
+  // Also: "wait for <text> to be gone"
+  const waitGoneMatch = t.match(
+    /^wait\s+(?:(\d+)\s*(?:s|sec|seconds?)?\s+)?(?:until|for|till)\s+["']?(.+?)["']?\s+(?:(?:is|to\s+be)\s+)?(?:gone|hidden|invisible|disappeared?|removed|not\s+visible|not\s+shown)(?:\s+(\d+)\s*(?:s|sec|seconds?)?)?$/i
+  );
+  if (waitGoneMatch) {
+    const text = stripTextPrefix(trimPunct(waitGoneMatch[2].trim()));
+    const timeout = waitGoneMatch[1]
+      ? Number(waitGoneMatch[1])
+      : waitGoneMatch[3]
+        ? Number(waitGoneMatch[3])
+        : 10;
+    if (text)
+      return { kind: 'waitUntil', condition: 'gone', text, timeoutSeconds: timeout, verbatim };
+  }
+
+  // "wait" / "wait a moment" / "wait a bit" (no number) — default 2 seconds
+  const waitBareMatch = t.match(
+    /^(?:wait|sleep|pause)(?:\s+(?:a\s+)?(?:moment|bit|while|sec|second))?$/i
+  );
+  if (waitBareMatch) {
+    return { kind: 'wait', seconds: 2, verbatim };
+  }
+
+  // "wait/sleep/pause [for] <N> [unit]" — time-delay wait.
+  // Accepts the full set of natural English unit phrasings (singular + plural,
+  // long + short). Listed longest-first so the regex engine matches greedily.
+  // Without `second` (singular) in this list, `wait for 1 second` falls through
+  // to the LLM parser, which can mis-classify it as `waitUntil "1 second" visible`.
+  const waitMatch = t.match(
+    /^(?:wait|sleep|pause)(?:\s+for)?\s+(\d+(?:\.\d+)?)\s*(milliseconds|millisecond|seconds|second|minutes|minute|hours|hour|ms|sec|min|hr|h|s)?$/i
+  );
+  if (waitMatch) {
+    const n = Number(waitMatch[1]);
+    if (!Number.isFinite(n) || n < 0) return null;
+    const unit = (waitMatch[2] ?? 's').toLowerCase();
+    // Order matters: check `ms`/`milli` before generic `m*` (minute) prefixes,
+    // and `min` before generic `m*` for the same reason. Without this, `1 minute`
+    // would be (mis)interpreted as 1 millisecond by the old `startsWith('m')` check.
+    let seconds: number;
+    if (unit === 'ms' || unit.startsWith('milli')) {
+      seconds = n / 1000;
+    } else if (unit.startsWith('min')) {
+      seconds = n * 60;
+    } else if (unit.startsWith('h')) {
+      seconds = n * 3600;
+    } else {
+      seconds = n; // s | sec | second(s) | unitless default
+    }
+    return { kind: 'wait', seconds, verbatim };
+  }
+
+  const backMatch = t.match(/^(?:go\s+)?back$|^navigate\s+back$|^press\s+back(?:\s+button)?$/i);
+  if (backMatch) return { kind: 'back', verbatim };
+
+  const homeMatch = t.match(
+    /^(?:go\s+)?home$|^go\s+to\s+home(?:\s+screen)?$|^press\s+home(?:\s+button)?$/i
+  );
+  if (homeMatch) return { kind: 'home', verbatim };
+
+  const enterMatch = t.match(
+    /^(?:press\s+enter|hit\s+enter|send\s+enter|pe[r]?form\s+search|submit|submit\s+search|submit\s+form|search|confirm|hit\s+return|press\s+return)$/i
+  );
+  if (enterMatch) return { kind: 'enter', verbatim };
+
+  const assertMatch =
+    t.match(
+      /^(?:assert|verify|check)\s+(?:that\s+|if\s+)?["']?(.+?)["']?\s+is\s+(?:visible|present|shown|displayed|on\s+(?:the\s+)?screen|in\s+(?:the\s+)?screen)$/i
+    ) ??
+    t.match(
+      /^(?:assert|verify|check)\s+(?:that\s+|if\s+)?["']?(.+?)["']?\s+(?:visible|present|shown|displayed|on\s+(?:the\s+)?screen|in\s+(?:the\s+)?screen)$/i
+    ) ??
+    t.match(/^(?:assert|verify|check)\s+(?:that\s+|if\s+)?["']?(.+?)["']?$/i);
+  if (assertMatch) {
+    // Don't strip trailing punctuation for asserts — "!" may be part of the actual text
+    const text = stripTextPrefix(assertMatch[1].trim());
+    if (text) return { kind: 'assert', text, verbatim };
+  }
+
+  // "toggle X" / "enable X" / "disable X" / "turn on X" / "turn off X" — tap-style
+  const toggleMatch = t.match(
+    /^(?:toggle|enable|disable|turn\s+on|turn\s+off|switch\s+on|switch\s+off)\s+(?:the\s+)?(.+)$/i
+  );
+  if (toggleMatch) {
+    const label = trimPunct(toggleMatch[1].trim());
+    if (label) return { kind: 'tap', label, verbatim };
+  }
+
+  // "close X" / "dismiss X" / "cancel X" — tap-style
+  const closeMatch = t.match(/^(?:close|dismiss|cancel)\s+(?:the\s+)?(.+)$/i);
+  if (closeMatch) {
+    const label = trimPunct(closeMatch[1].trim());
+    if (label) return { kind: 'tap', label, verbatim };
+  }
+
+  const doneMatch = t.match(/^done(?:\s*[:\-]\s*|\s+)(.+)$/i);
+  if (doneMatch) {
+    return { kind: 'done', message: trimPunct(doneMatch[1].trim()), verbatim };
+  }
+  if (/^done\.?$/i.test(t)) {
+    return { kind: 'done', verbatim };
+  }
+
+  return null;
+}

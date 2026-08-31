@@ -1,7 +1,7 @@
 ---
 name: use-appclaw-cli
 description: >
-  Use the AppClaw CLI to run YAML flows, start interactive playground, explore apps,
+  Use the AppClaw CLI to run YAML flows, start the interactive TUI shell, explore apps,
   record/replay sessions, configure devices, and troubleshoot. Trigger for any request
   involving appclaw commands, device setup, .env configuration, running flows, vision
   setup, or debugging execution failures.
@@ -62,10 +62,10 @@ npm start -- --flow examples/flows/google-search.yaml
 ### 1. Agent Mode (default) — LLM-driven automation
 
 ```sh
-# Interactive — prompts for platform, device, goal
+# Resident shell — device picker, then a prompt you can run goal after goal in
 appclaw
 
-# Pass goal directly
+# One goal, then exit — holds the finished screen until a key is pressed
 appclaw "Open Settings and turn on WiFi"
 appclaw "Send hello on WhatsApp to Mom"
 
@@ -73,9 +73,22 @@ appclaw "Send hello on WhatsApp to Mom"
 appclaw --platform ios --device-type simulator "Open Safari"
 appclaw --platform ios --device "iPhone 17 Pro" "Open Settings"
 appclaw --udid 00008120-XXXX "Launch YouTube"
+
+# Unattended (CI, scripts): plain console output, exits on its own
+APPCLAW_TUI=off appclaw "Open Settings"
 ```
 
-**Requires:** `LLM_API_KEY` in `.env` (except Ollama).
+Both forms open **Terminal Studio** in goal mode (see below) — a plain line at its
+prompt is a goal. The exit code is unchanged: 0 when every sub-goal completed, 1
+otherwise. `--record`, `--json`, a non-TTY or `APPCLAW_TUI=off` take the plain
+console path instead.
+
+Add `--export [path]` to write the finished run out as a replayable
+`@appclaw/runner` spec (`--export-dir` or `EXPORT_DIR` decides where a bare
+filename lands; default `tests`). Inside the shell the same thing is `/export`.
+
+**Requires:** `LLM_API_KEY` in `.env` (except Ollama). If it is missing the shell
+says so on a setup screen and offers to write it, rather than exiting.
 
 ### 2. YAML Flow Mode — declarative, no LLM cost
 
@@ -91,17 +104,24 @@ appclaw --flow tests/flows/youtube-phased.yaml --env dev
 
 **No LLM key needed** unless the flow has steps that fall back to LLM parsing (unrecognized natural language).
 
-### 3. Playground — interactive REPL
+### 3. Terminal Studio (`--tui`, alias `--playground`)
 
 ```sh
-appclaw --playground
-appclaw --playground --platform ios --device-type simulator
-appclaw --playground --device "iPhone 17 Pro"
+appclaw --tui
+appclaw --tui --platform ios --device-type simulator
+appclaw --tui --device "iPhone 17 Pro"
 ```
 
-Type natural language commands that execute live on the device. Steps accumulate and can be exported to a YAML flow.
+One shell, two modes, decided by what a plain (non-slash) line means:
 
-**REPL commands:** `/help`, `/steps`, `/export`, `/clear`, `/device`, `/disconnect`
+- **record** (`--tui`) — a plain line is one deterministic instruction, run live on the device and appended to a recording. `/list`, `/yaml`, `/edit` and `/export` work on that recording.
+- **goal** (bare `appclaw`) — a plain line is a goal, run through the full planner. Nothing is recorded; `/export` writes the run the agent just did.
+
+`/mode goal|record` switches without dropping the device session, and `/goal <text>` works in either. The command palette is listed permanently in record mode; in goal mode it stays hidden until the line starts with `/`.
+
+`--playground` is an alias for `--tui` — the old playground REPL was removed. (`--json --playground` is different: a headless NDJSON bridge used by the VS Code / Cursor extension, not something to run by hand.)
+
+Full-screen Ink shell: platform/device picker, slash-command palette, settings, run history. Device mirroring (Android only) draws the screen **inside the terminal** — Kitty graphics on Ghostty/kitty/WezTerm, 24-bit ANSI half-blocks everywhere else — at ~5fps via `adb screencap`. Start it with `^r` or `/stream`, freeze it with `^p`, tear it down with `^x`; `--stream` starts it as soon as the session opens, which is the only way to see it during `appclaw "a goal"`. Requires an interactive terminal; incompatible with `--json`.
 
 ### 4. Explorer — PRD to test flows
 
@@ -317,7 +337,7 @@ Records successful trajectories to `~/.appclaw/trajectories.json` and reuses the
 - `appclaw "goal"` (agent mode — uses LLM credits, takes actions on device)
 - `appclaw --explore` (LLM credits + device crawling)
 - `appclaw --record` (agent mode + saves recording)
-- `appclaw --playground` (interactive device session)
+- `appclaw` / `appclaw --tui` (interactive device session; goals typed inside it use LLM credits — `--playground` is an alias for `--tui`)
 
 Why: agent and explorer modes consume LLM API credits and take real actions on the connected device.
 
@@ -390,8 +410,8 @@ appclaw --flow tests/flows/youtube-phased.yaml --env dev
 ### Quick test on iOS simulator
 
 ```sh
-appclaw --platform ios --device-type simulator --playground
-# In REPL: type commands, test them, /export to YAML
+appclaw --platform ios --device-type simulator --tui
+# In the TUI: type commands, test them, /export to YAML
 ```
 
 ### Generate test flows from a PRD

@@ -8,12 +8,13 @@ import {
   interpolate,
   hasPlaceholders,
   interpolateStep,
+  redactSensitiveData,
   loadEnvironmentFile,
   loadInlineBindings,
   mergeBindings,
   emptyBindings,
   type VariableBindings,
-} from '../../src/flow/variable-resolver.js';
+} from '@appclaw/core/flow/variable-resolver';
 
 // ── interpolate ─────────────────────────────────────────────────────
 
@@ -141,6 +142,29 @@ describe('interpolateStep', () => {
     const result = interpolateStep(step, bindings);
     expect(result.text).toBe('p4ss');
     expect(result.verbatim).toBe('type "***"');
+    expect(result.sensitive).toBe(true);
+    expect(result.sensitiveValues).toEqual(['p4ss']);
+  });
+
+  test('interpolates and tracks secrets inside nested selectors', () => {
+    const step = {
+      kind: 'assert' as const,
+      selector: { id: 'password', value: '${secrets.__TEST_PASS}' },
+      properties: { value: '${secrets.__TEST_PASS}' },
+    };
+    const result = interpolateStep(step, bindings);
+    expect(result.selector.value).toBe('p4ss');
+    expect(result.properties.value).toBe('p4ss');
+    expect(result.sensitiveValues).toEqual(['p4ss']);
+    expect(
+      redactSensitiveData(
+        { message: 'expected p4ss', selector: result.selector },
+        result.sensitiveValues
+      )
+    ).toEqual({
+      message: 'expected ***',
+      selector: { id: 'password', value: '***' },
+    });
   });
 
   test('returns same object when bindings are empty and no secrets', () => {

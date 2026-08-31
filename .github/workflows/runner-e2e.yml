@@ -1,0 +1,62 @@
+name: Runner E2E (2 Android emulators)
+
+# End-to-end test of the parallel runner (examples/runner), split into two routes:
+#
+#   dom    — AGENT_MODE=dom. Text-only LLM calls (step parsing / assertions),
+#            cheap enough to gate every PR.
+#   vision — AGENT_MODE=vision. Gemini vision on screenshots, expensive; runs
+#            only when a maintainer applies the "AI" label to the PR (labels
+#            need triage+ permission, so the label IS the admin gate). Once
+#            labeled, later pushes to the PR re-run the vision route too.
+#
+# Both routes share the same reusable body (runner-e2e-run.yml): 2 emulators,
+# `appclaw-runner --workers 2` over the example specs. Manual runs from the
+# Actions tab execute the dom route.
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'LLM provider'
+        required: false
+        default: 'gemini'
+      model:
+        description: 'LLM model ID (blank = provider default)'
+        required: false
+        default: ''
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  dom:
+    name: DOM route
+    # A bare "labeled" event only concerns the vision route. Fork PRs cannot
+    # receive LLM_API_KEY, so do not invoke the secret-required workflow there.
+    if: >-
+      github.event.action != 'labeled' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    concurrency:
+      group: runner-e2e-dom-${{ github.ref }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/runner-e2e-run.yml
+    with:
+      agent-mode: dom
+      provider: ${{ github.event.inputs.provider || 'gemini' }}
+      model: ${{ github.event.inputs.model || '' }}
+    secrets: inherit
+
+  vision:
+    name: Vision route (AI label)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'AI')
+    concurrency:
+      group: runner-e2e-vision-${{ github.ref }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/runner-e2e-run.yml
+    with:
+      agent-mode: vision
+      provider: gemini
+    secrets: inherit

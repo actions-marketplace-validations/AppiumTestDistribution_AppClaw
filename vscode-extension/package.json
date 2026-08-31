@@ -80,7 +80,7 @@
       },
       {
         "command": "appclaw.playground",
-        "title": "AppClaw: Start Playground",
+        "title": "AppClaw: Start Terminal Studio",
         "icon": "$(terminal)"
       },
       {
@@ -217,7 +217,7 @@
           "appclaw.llmModel": {
             "type": "string",
             "default": "",
-            "markdownDescription": "Model name override. Leave empty for the provider default (e.g. `gemini-3.1-flash-lite-preview` for Gemini)."
+            "markdownDescription": "Model name override. Leave empty for the provider default (e.g. `gemini-3.1-flash-lite` for Gemini)."
           }
         }
       },

@@ -1,78 +1,48 @@
 {
   "name": "appclaw",
-  "version": "1.3.0",
+  "version": "2.6.0",
   "description": "Agentic AI layer for mobile automation via appium-mcp",
   "type": "module",
-  "main": "dist/sdk/index.js",
-  "types": "dist/sdk/index.d.ts",
-  "exports": {
-    ".": {
-      "import": "./dist/sdk/index.js",
-      "types": "./dist/sdk/index.d.ts"
-    },
-    "./cli": {
-      "import": "./dist/index.js"
-    }
-  },
-  "bin": {
-    "appclaw": "bin/appclaw.js"
-  },
-  "files": [
-    "dist",
-    "bin"
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "examples/runner"
   ],
   "scripts": {
-    "start": "npx tsx src/index.ts",
-    "dev": "npx tsx --watch src/index.ts",
-    "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "build": "npm run build -w @appclaw/core && npm run build -w @appclaw/cli && npm run build -w @appclaw/runner && npm run build -w @appclaw/agent",
+    "typecheck": "npm run build -w @appclaw/core && npm run typecheck -w @appclaw/cli && npm run typecheck -w @appclaw/runner && npm run typecheck -w @appclaw/agent",
     "lint": "npm run typecheck",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run tests/flow tests/sdk",
+    "preview": "npx tsx scripts/generate-preview.ts preview",
+    "pretest": "npm run build",
+    "test": "vitest run tests/flow tests/sdk tests/ui",
     "test:e2e": "vitest run tests/e2e/",
-    "test:e2e:android": "MCP_DEBUG=1 vitest run tests/e2e/android.test.ts",
-    "test:watch": "vitest tests/flow tests/sdk",
+    "test:e2e:android": "MCP_DEBUG=1 vitest run tests/vodqa.test.ts",
+    "test:watch": "vitest tests/flow tests/sdk tests/ui",
     "build:vsix": "cd vscode-extension && npm run build && npx vsce package",
     "deploy:landing": "npm run deploy --prefix landing"
-  },
-  "dependencies": {
-    "appium-mcp": "^1.67.0",
-    "@ai-sdk/anthropic": "^1.0.0",
-    "@ai-sdk/google": "^3.0.43",
-    "@ai-sdk/openai": "^1.0.0",
-    "@modelcontextprotocol/sdk": "^1.22.0",
-    "ai": "^6.0.72",
-    "ai-sdk-ollama": "3.8.3",
-    "boxen": "^8.0.1",
-    "chalk": "^5.6.2",
-    "cli-spinners": "^3.4.0",
-    "cli-table3": "^0.6.5",
-    "df-vision": "1.1.77",
-    "dotenv": "^17.3.1",
-    "fast-xml-parser": "^4.5.0",
-    "gradient-string": "^3.0.0",
-    "marked": "^15.0.12",
-    "marked-terminal": "^7.3.0",
-    "mjpeg-consumer": "2.0.0",
-    "sharp": "^0.33.5",
-    "yaml": "^2.8.3",
-    "zod": "^3.23.0"
   },
   "devDependencies": {
     "@semantic-release/changelog": "^6.0.3",
     "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/exec": "^7.1.0",
     "@semantic-release/git": "^10.0.1",
     "@semantic-release/github": "^11.0.6",
     "@semantic-release/npm": "^12.0.2",
     "@semantic-release/release-notes-generator": "^14.1.0",
     "@types/bun": "^1.1.0",
     "@types/gradient-string": "^1.1.6",
+    "@types/react": "^18.3.31",
     "conventional-changelog-conventionalcommits": "^9.3.1",
-    "prettier": "^3.8.1",
+    "ink-testing-library": "^4.0.0",
+    "prettier": "3.8.3",
     "semantic-release": "^24.2.9",
     "tsx": "^4.21.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.2"
+  },
+  "overrides": {
+    "jose": "^6.1.3"
   }
 }

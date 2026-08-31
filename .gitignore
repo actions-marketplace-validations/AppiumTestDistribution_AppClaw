@@ -3,7 +3,13 @@ dist/
 .env
 *.log
 .DS_Store
+# JetBrains workspace state — per-developer, never shared
+.idea/
+*.iml
 .claude/
 recordings/
 logs/
 .appclaw/
+# Generated HTML report preview (npm run preview) — ephemeral CI smoke output
+preview/
+.npmrc

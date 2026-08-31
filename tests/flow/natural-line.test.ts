@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'vitest';
-import { tryParseNaturalFlowLine } from '../../src/flow/natural-line.js';
-import type { FlowStep } from '../../src/flow/types.js';
+import { tryParseNaturalFlowLine } from '@appclaw/core/flow/natural-line';
+import type { FlowStep } from '@appclaw/core/flow/types';
 
 // Helper to assert step kind and key fields
 function expectStep(input: string, expected: Partial<FlowStep> & { kind: string }) {
@@ -42,6 +42,37 @@ describe('natural-line: tap/click', () => {
     expectStep('tap the Login button', { kind: 'tap', label: 'Login button' }));
 });
 
+// ── Close/terminate app ─────────────────────────────────────────────
+
+describe('natural-line: close app', () => {
+  test('close app → closeApp (no query)', () => {
+    const r = tryParseNaturalFlowLine('close app');
+    expect(r?.kind).toBe('closeApp');
+    expect(r?.kind === 'closeApp' && r.query).toBeUndefined();
+  });
+  test('close the app → closeApp (no query)', () => {
+    const r = tryParseNaturalFlowLine('close the app');
+    expect(r?.kind === 'closeApp' && r.query).toBeUndefined();
+  });
+  test('close <name> app', () =>
+    expectStep('close youtube app', { kind: 'closeApp', query: 'youtube' }));
+  test('close the <name> app', () =>
+    expectStep('close the youtube app', { kind: 'closeApp', query: 'youtube' }));
+  test('terminate <name>', () =>
+    expectStep('terminate youtube', { kind: 'closeApp', query: 'youtube' }));
+  test('quit <name>', () => expectStep('quit settings', { kind: 'closeApp', query: 'settings' }));
+  test('kill the <name> app', () =>
+    expectStep('kill the chrome app', { kind: 'closeApp', query: 'chrome' }));
+  test('terminate the app → no query', () => {
+    const r = tryParseNaturalFlowLine('terminate the app');
+    expect(r?.kind === 'closeApp' && r.query).toBeUndefined();
+  });
+  test('"close the dialog" is NOT a closeApp (no app keyword)', () => {
+    const r = tryParseNaturalFlowLine('close the dialog');
+    expect(r?.kind === 'closeApp').toBe(false);
+  });
+});
+
 // ── Navigate ────────────────────────────────────────────────────────
 
 describe('natural-line: navigate', () => {
@@ -78,6 +109,112 @@ describe('natural-line: type', () => {
       expect(result!.text).toBe('appium 3.0');
       expect(result!.target).toBe('search bar');
     }
+  });
+});
+
+// ── Type: field-first "as/to/with" ──────────────────────────────────
+
+describe('natural-line: type field-first', () => {
+  const typed = (input: string) => {
+    const r = tryParseNaturalFlowLine(input);
+    expect(r?.kind).toBe('type');
+    return r as Extract<FlowStep, { kind: 'type' }>;
+  };
+  test('type the <field> as <value>', () => {
+    const r = typed('type the username as appclaw@gmail.com');
+    expect(r.target).toBe('username');
+    expect(r.text).toBe('appclaw@gmail.com');
+  });
+  test('set the <field> to <value>', () => {
+    const r = typed('set the quantity to 5');
+    expect(r.target).toBe('quantity');
+    expect(r.text).toBe('5');
+  });
+  test('fill the <field> with <value>', () => {
+    const r = typed('fill the email with test@x.com');
+    expect(r.target).toBe('email');
+    expect(r.text).toBe('test@x.com');
+  });
+  test('literal text without leading "the" is not split', () => {
+    const r = typed('type save as draft');
+    expect(r.text).toBe('save as draft');
+    expect(r.target).toBeUndefined();
+  });
+});
+
+// ── Proximity qualifiers (tap + type) ────────────────────────────────
+
+describe('natural-line: proximity', () => {
+  test('tap <target> below <anchor>', () => {
+    const r = tryParseNaturalFlowLine('click login button below password field');
+    expect(r?.kind).toBe('tap');
+    if (r?.kind === 'tap') {
+      expect(r.label).toBe('login button');
+      expect(r.proximity).toEqual({ relation: 'below', anchor: 'password field' });
+    }
+  });
+  test.each([
+    ['tap the title above the form', 'above'],
+    ['tap icon under the header', 'below'],
+    ['tap the arrow to the left of the title', 'toLeftOf'],
+    ['tap the icon right of the label', 'toRightOf'],
+    ['tap the checkbox next to Terms', 'near'],
+    ['tap the star beside the rating', 'near'],
+    ['tap the button inside the dialog', 'within'],
+    ['tap login within the form', 'within'],
+  ])('%s → %s', (input, relation) => {
+    const r = tryParseNaturalFlowLine(input);
+    expect(r?.kind === 'tap' && r.proximity?.relation).toBe(relation);
+  });
+  test('anchor strips leading "the"', () => {
+    const r = tryParseNaturalFlowLine('tap the arrow to the left of the title');
+    expect(r?.kind === 'tap' && r.proximity?.anchor).toBe('title');
+  });
+  test('type target carries proximity too', () => {
+    const r = tryParseNaturalFlowLine('enter hi in the field below the header');
+    expect(r?.kind).toBe('type');
+    if (r?.kind === 'type') {
+      expect(r.text).toBe('hi');
+      expect(r.target).toBe('field');
+      expect(r.proximity).toEqual({ relation: 'below', anchor: 'header' });
+    }
+  });
+  test('chained qualifier with "which is" connector', () => {
+    const r = tryParseNaturalFlowLine('click on YESBANK to the left of NSEFO which is near ₹0.04');
+    expect(r?.kind).toBe('tap');
+    if (r?.kind === 'tap') {
+      expect(r.label).toBe('YESBANK');
+      expect(r.proximity).toEqual({
+        relation: 'toLeftOf',
+        anchor: 'NSEFO',
+        anchorProximity: { relation: 'near', anchor: '₹0.04' },
+      });
+    }
+  });
+  test('chained qualifier without connector', () => {
+    const r = tryParseNaturalFlowLine('tap YESBANK to the left of OPT near ₹2.90');
+    expect(r?.kind === 'tap' && r.proximity).toEqual({
+      relation: 'toLeftOf',
+      anchor: 'OPT',
+      anchorProximity: { relation: 'near', anchor: '₹2.90' },
+    });
+  });
+  test('connector on the target: "X which is below Y"', () => {
+    const r = tryParseNaturalFlowLine('tap YESBANK which is below the search bar');
+    expect(r?.kind === 'tap' && r.label).toBe('YESBANK');
+    expect(r?.kind === 'tap' && r.proximity).toEqual({
+      relation: 'below',
+      anchor: 'search bar',
+    });
+  });
+  test('no false positive: plain tap', () => {
+    const r = tryParseNaturalFlowLine('tap Settings');
+    expect(r?.kind === 'tap' && r.proximity).toBeUndefined();
+  });
+  test('no false positive: relation word with no anchor stays literal', () => {
+    const r = tryParseNaturalFlowLine('tap show more below');
+    expect(r?.kind === 'tap' && r.label).toBe('show more below');
+    expect(r?.kind === 'tap' && r.proximity).toBeUndefined();
   });
 });
 
@@ -338,5 +475,139 @@ describe('natural-line: returns null for unrecognized', () => {
     const r = tryParseNaturalFlowLine('the quick brown fox');
     // Could be null or could match something — just ensure no crash
     expect(r === null || r.kind !== undefined).toBe(true);
+  });
+});
+
+describe('natural-line: double tap', () => {
+  test('double tap X', () => {
+    expect(tryParseNaturalFlowLine('double tap Photo')).toMatchObject({
+      kind: 'doubleTap',
+      label: 'Photo',
+    });
+  });
+  test('double-click on the image', () => {
+    expect(tryParseNaturalFlowLine('double-click on the image')).toMatchObject({
+      kind: 'doubleTap',
+      label: 'image',
+    });
+  });
+  test('double tap carries a spatial qualifier', () => {
+    expect(tryParseNaturalFlowLine('double tap YESBANK to the left of BSE')).toMatchObject({
+      kind: 'doubleTap',
+      label: 'YESBANK',
+      proximity: { relation: 'toLeftOf', anchor: 'BSE' },
+    });
+  });
+  test('single tap is unaffected', () => {
+    expect(tryParseNaturalFlowLine('tap Photo')).toMatchObject({ kind: 'tap', label: 'Photo' });
+  });
+});
+
+describe('natural-line: anchored scrollAssert', () => {
+  test('swipe the <anchor> left until <text> is visible', () => {
+    expect(
+      tryParseNaturalFlowLine('swipe the FII/DII left until Goal calculator is visible')
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'FII/DII',
+      direction: 'left',
+      text: 'Goal calculator',
+      maxScrolls: 3,
+    });
+  });
+  test('anchored form with an explicit count', () => {
+    expect(
+      tryParseNaturalFlowLine('swipe the FII/DII left 5 times until Goal calculator is visible')
+    ).toMatchObject({ kind: 'scrollAssert', target: 'FII/DII', maxScrolls: 5 });
+  });
+  test('plain scroll-until keeps working without a target', () => {
+    const r = tryParseNaturalFlowLine('scroll down until Checkout is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', direction: 'down', text: 'Checkout' });
+    expect(r && 'target' in r ? r.target : undefined).toBeUndefined();
+  });
+  test('swipe verb without a target parses too', () => {
+    const r = tryParseNaturalFlowLine('swipe left until Reviews is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', direction: 'left', text: 'Reviews' });
+    expect(r && 'target' in r ? r.target : undefined).toBeUndefined();
+  });
+  test('anchored swipe WITHOUT until stays a plain swipe step', () => {
+    expect(tryParseNaturalFlowLine('swipe the FII/DII left')).toMatchObject({
+      kind: 'swipe',
+      direction: 'left',
+      target: 'FII/DII',
+    });
+  });
+});
+
+describe('natural-line: spatially-qualified scroll areas', () => {
+  test('direction-first region form: "swipe left inside the area above View All until …"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      direction: 'left',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+      text: 'Goal calculator',
+    });
+  });
+  test('connector filler is stripped: "…the area that is located above View All…"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area that is located above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+    });
+  });
+  test('qualified labeled target: "swipe the FII/DII below Post-Market Insights left until …"', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe the FII/DII below Post-Market Insights left until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      direction: 'left',
+      target: 'FII/DII',
+      targetProximity: { relation: 'below', anchor: 'Post-Market Insights' },
+      text: 'Goal calculator',
+    });
+  });
+  test('unqualified anchored form still has no targetProximity', () => {
+    const r = tryParseNaturalFlowLine('swipe the FII/DII left until Goal calculator is visible');
+    expect(r).toMatchObject({ kind: 'scrollAssert', target: 'FII/DII' });
+    expect(r && 'targetProximity' in r ? r.targetProximity : undefined).toBeUndefined();
+  });
+});
+
+describe('natural-line: participle labels are not mangled by connector stripping', () => {
+  test('"Order Placed" survives as a proximity target', () => {
+    expect(tryParseNaturalFlowLine('tap Order Placed below Filters')).toMatchObject({
+      kind: 'tap',
+      label: 'Order Placed',
+      proximity: { relation: 'below', anchor: 'Filters' },
+    });
+  });
+  test('"Conveniently Located" survives too', () => {
+    expect(tryParseNaturalFlowLine('tap Conveniently Located near the map')).toMatchObject({
+      kind: 'tap',
+      label: 'Conveniently Located',
+      proximity: { relation: 'near', anchor: 'map' },
+    });
+  });
+  test('bare participle IS stripped after a generic region noun', () => {
+    expect(
+      tryParseNaturalFlowLine(
+        'swipe left inside the area located above View All until Goal calculator is visible'
+      )
+    ).toMatchObject({
+      kind: 'scrollAssert',
+      target: 'area',
+      targetProximity: { relation: 'above', anchor: 'View All' },
+    });
   });
 });
